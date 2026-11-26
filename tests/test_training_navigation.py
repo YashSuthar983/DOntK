@@ -146,3 +146,34 @@ def test_per_level_seed_counts_and_calibration(tmp_path):
     both = dict(levels=[dict(exit_rate=.4), dict(exit_rate=.4)], exit_rate=.4, weighted_total_score=80)
     assert calibration_rank(both, "clear") > calibration_rank(easy_only, "clear")
     assert calibration_rank(both, "score") < calibration_rank(easy_only, "score")
+
+
+def test_lock_all_door_requires_all_three_keys(tmp_path):
+    builder = GridUDMFBuilder()
+    for x in range(4):
+        builder.set_cell(x, 0, CellSpec(x + 1, is_door=x == 2, door_lock=101 if x == 2 else 0))
+    builder.add_switch(SwitchSpec(3, 0, "E", special=243))
+    builder.add_thing(0, 0, 1, angle=0)
+    wad = tmp_path / "lock_all.wad"
+    write_wad(wad, [Lump("MAP01", b""), Lump("TEXTMAP", builder.compile_textmap().encode()), Lump("ENDMAP", b"")])
+    env = FastDoomPackEnv(wad)
+    try:
+        env.reset(map_name="MAP01", seed=0)
+        base = env.env.privileged_state()
+        door_cells = next(iter(env._fields["MAP01"].door_cells.values()))
+
+        # Only blue card: LOCK_ALL (101) door must remain blocked
+        one_key = {**base, "keys": np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)}
+        blocked_one = env._locked_blocked_grid(one_key)
+        assert blocked_one is not None and all(blocked_one[cx, cy] for cx, cy in door_cells)
+
+        # Two colors (blue + yellow): still blocked
+        two_keys = {**base, "keys": np.array([1.0, 1.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)}
+        blocked_two = env._locked_blocked_grid(two_keys)
+        assert blocked_two is not None and all(blocked_two[cx, cy] for cx, cy in door_cells)
+
+        # All three colors (blue card + yellow skull + red card): passable
+        all_keys = {**base, "keys": np.array([1.0, 0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)}
+        assert env._locked_blocked_grid(all_keys) is None
+    finally:
+        env.close()
