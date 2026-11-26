@@ -40,13 +40,17 @@ from aegis3d import (
     factored_to_multibinary,
 )
 from training.frontier_oracle import FrontierOracle
+from training.objective_oracle import ObjectiveOracle
 from training.wad_oracle import FastDoomPackEnv
 
 
 # ---------------------------------------------------------------------------
 # Multiprocessing Vectorized Environment (ViZDoom + Fog-of-War + FrontierOracle)
 # ---------------------------------------------------------------------------
-def _worker_loop(conn, wad_paths: list[str], episode_ticks: int, gamma: float, seed_base: int, use_oracle: bool) -> None:
+def _worker_loop(
+    conn, wad_paths: list[str], episode_ticks: int, gamma: float, seed_base: int,
+    use_oracle: bool, teacher: str,
+) -> None:
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     envs = [
@@ -59,7 +63,8 @@ def _worker_loop(conn, wad_paths: list[str], episode_ticks: int, gamma: float, s
         )
         for wp in wad_paths
     ]
-    oracles = [FrontierOracle() for _ in envs] if use_oracle else None
+    oracle_type = {"frontier": FrontierOracle, "objective": ObjectiveOracle}[teacher]
+    oracles = [oracle_type() for _ in envs] if use_oracle else None
 
     def _pack(obs_l, inf_l, o_acts, rews, dones, exits):
         return {
@@ -144,6 +149,7 @@ class SubprocDoomVecEnv:
         gamma: float,
         use_oracle: bool,
         seed: int = 1000,
+        teacher: str = "frontier",
     ) -> None:
         self.num_envs = num_envs
         self.num_workers = max(1, min(num_workers, num_envs))
@@ -162,7 +168,7 @@ class SubprocDoomVecEnv:
             parent_c, child_c = ctx.Pipe()
             p = ctx.Process(
                 target=_worker_loop,
-                args=(child_c, w_wads, episode_ticks, gamma, seed + offset * 17, use_oracle),
+                args=(child_c, w_wads, episode_ticks, gamma, seed + offset * 17, use_oracle, teacher),
                 daemon=True,
             )
             p.start()
@@ -349,6 +355,8 @@ def _grounding_loss(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", required=True, choices=("dagger", "ppo"))
+    ap.add_argument("--teacher", choices=("frontier", "objective"), default="frontier",
+                    help="DAgger teacher. Objective uses the training map to prioritize reachable exits.")
     ap.add_argument("--wad", nargs="+", required=True)
     ap.add_argument("--num-envs", type=int, default=16)
     ap.add_argument("--num-workers", type=int, default=4)
@@ -444,6 +452,7 @@ def main() -> None:
         gamma=args.gamma,
         use_oracle=(args.mode == "dagger"),
         seed=args.seed,
+        teacher=args.teacher,
     )
 
     N = args.num_envs
