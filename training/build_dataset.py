@@ -18,8 +18,9 @@ TIER_TICKS = {1: 2100, 2: 2800, 3: 3500, 4: 4200}
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default="training/wads")
-    ap.add_argument("--train-maps-per-tier", type=int, default=50)
+    ap.add_argument("--train-maps-per-tier", type=int, default=100)
     ap.add_argument("--eval-maps-per-tier", type=int, default=10)
+    ap.add_argument("--train-only", action="store_true", help="Rebuild only train shards; keep eval_locked untouched")
     args = ap.parse_args()
 
     out = Path(args.out_dir)
@@ -33,9 +34,12 @@ def main() -> None:
             train_dir / f"tier{tier}_train.wad",
             tier=tier,
             num_maps=args.train_maps_per_tier,
-            base_seed=10000 * tier,
+            base_seed=20000 * tier,
         )
         print(f"Built train shard: {p} ({args.train_maps_per_tier} maps)")
+
+    if args.train_only:
+        return
 
     suite: list[dict] = []
     for tier in (1, 2, 3, 4):

@@ -1,4 +1,4 @@
-"""Evaluation entry point for AEGIS-3D. The scorer instantiates DoomAgent from this file.
+"""Evaluation entry point for AEGIS-3D v2. The scorer instantiates DoomAgent from this file.
 
 Contract: docs/CONTRACT.md §6.
 All decisions flow strictly through trained neural network parameters in AEGIS3D.
@@ -16,21 +16,34 @@ from aegis3d import AEGIS3D, factored_to_multibinary
 SUBMISSION_DIR = Path(__file__).resolve().parent
 WEIGHTS_PATH = SUBMISSION_DIR / "weights" / "aegis3d.pt"
 
+# Default calibrated per-head sampling temperatures:
+# [MoveFB, StrafeLR, TurnLR, Attack, Use, NextWeapon]
+# Empirically validated "sharp" profile: crisp aim/move/turn, deadlock-free USE! (0.0 = greedy argmax)
+DEFAULT_DECODE_TEMPS = (0.20, 0.30, 0.20, 0.15, 0.55, 0.15)
+
 
 class DoomAgent:
     def __init__(self, observation_space, action_space, device: str):
-        """Load AEGIS-3D weights once onto `device` ("cuda" or "cpu") and warm up kernels."""
+        """Load AEGIS-3D v2 weights once onto `device` ("cuda" or "cpu") and warm up kernels."""
         self.observation_space = observation_space
         self.action_space = action_space
         self.device = torch.device(device if (device == "cuda" and torch.cuda.is_available()) else "cpu")
 
         self.model = AEGIS3D(include_training_heads=False).to(self.device)
+        self.decode_temps = DEFAULT_DECODE_TEMPS
         if WEIGHTS_PATH.is_file():
             ckpt = torch.load(WEIGHTS_PATH, map_location=self.device, weights_only=True)
-            state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+            if isinstance(ckpt, dict) and "model" in ckpt:
+                state_dict = ckpt["model"]
+                if "decode_temps" in ckpt:
+                    self.decode_temps = tuple(float(x) for x in ckpt["decode_temps"])
+            else:
+                state_dict = ckpt
             self.model.load_state_dict(state_dict, strict=True)
         self.model.eval()
         self.state = self.model.init_state(1, self.device)
+        self._rng = torch.Generator(device="cpu")
+        self._rng.manual_seed(2026)
 
         # Warm up CUDA/CPU kernels inside the generous 60s init budget so first act() is instant
         dummy = {
@@ -51,12 +64,13 @@ class DoomAgent:
         self.reset()
 
     def reset(self) -> None:
-        """Clear all recurrent, BEV, landmark slot, keyframe, and E3B episodic states before each map."""
+        """Clear all recurrent, BEV, landmark slot, and E3B episodic states before each map."""
         self.state = self.model.init_state(1, self.device)
+        self._rng.manual_seed(2026)
 
     @torch.inference_mode()
     def act(self, observation: dict) -> np.ndarray:
-        """Return a valid MultiBinary(9) int8 action from trained AEGIS-3D neural parameters."""
+        """Return a valid MultiBinary(9) int8 action from trained AEGIS-3D v2 neural parameters."""
         dev = self.device
         obs_t = {
             "rgb": torch.from_numpy(np.ascontiguousarray(observation["rgb"])).unsqueeze(0).to(dev, non_blocking=True),
@@ -70,7 +84,14 @@ class DoomAgent:
         }
 
         logits, next_state, _ = self.model.forward_step(obs_t, self.state)
-        factored = torch.stack([lg.argmax(dim=-1) for lg in logits], dim=-1)  # (1, 6)
+        picks = []
+        for lg, tau in zip(logits, self.decode_temps):
+            if tau <= 1e-4:
+                picks.append(lg.argmax(dim=-1))
+            else:
+                probs = torch.softmax(lg.float() / tau, dim=-1).cpu()
+                picks.append(torch.multinomial(probs, num_samples=1, generator=self._rng).squeeze(-1).to(dev))
+        factored = torch.stack(picks, dim=-1)  # (1, 6)
         action_mb = factored_to_multibinary(factored)  # (1, 9) int8
         self.state = self.model.update_state_with_action(next_state, action_mb)
         return action_mb[0].cpu().numpy()

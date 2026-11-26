@@ -27,6 +27,8 @@ WALL_TEXTURES = ("STARTAN2", "STONE2", "BROWN1", "GRAY1", "TEKWALL1", "COMPTALL"
 FLOOR_TEXTURES = ("FLOOR0_1", "FLOOR4_8", "FLAT14", "FLAT5_4", "FLOOR7_1", "MFLR8_1", "CEIL3_5")
 CEIL_TEXTURES = ("CEIL1_1", "CEIL3_5", "FLAT19", "CEIL5_1")
 DOOR_TEXTURES = ("BIGDOOR2", "BIGDOOR3", "BIGDOOR4")
+SWITCH_TEXTURES = ("SW1COMP", "SW1BRCOM", "SW1EXIT", "SW1STRTN", "SW1GARG", "SW1METAL", "SW1STONE")
+EXIT_FLOOR_TEXTURES = ("GATE3", "GATE1", "GATE4", "COMP01", "TLITE6_4")
 LOCK_TEXTURES = {129: "DOORRED", 130: "DOORBLU", 131: "DOORYEL"}
 KEY_THINGS = {
     129: (13, 38),  # RedCard, RedSkull
@@ -260,7 +262,7 @@ class GridUDMFBuilder:
             out.append(f"vertex {{ x = {vx:.1f}; y = {vy:.1f}; }}")
         for s in sec_specs:
             ceil_h = s.floor if s.is_door else s.ceil
-            floor_tex = "GATE3" if s.is_exit_pad else ("NUKAGE1" if s.is_toxic else s.floor_tex)
+            floor_tex = s.floor_tex if (s.is_exit_pad and s.floor_tex in EXIT_FLOOR_TEXTURES) else ("GATE3" if s.is_exit_pad else ("NUKAGE1" if s.is_toxic else s.floor_tex))
             extra = ""
             if s.door_tag > 0:
                 extra += f" id = {s.door_tag};"
@@ -409,7 +411,13 @@ def generate_tier_map(tier: int, seed: int, map_name: str = "MAP01") -> tuple[st
         occupied.append(nxt)
         edges.append((p_idx, c_idx))
 
-    # Optionally add 1 loop edge in Tier 2-4 (only between unlocked rooms, added after lock assignment)
+    # Identify tree connectivity BEFORE carving rooms so one-way drop-offs NEVER soft-lock the map!
+    adj: dict[int, list[int]] = {i: [] for i in range(num_rooms)}
+    parent_of: dict[int, int] = {}
+    for p, c in edges:
+        adj[p].append(c)
+        parent_of[c] = p
+
     # Carve rooms at macro-coordinates * 8
     room_centers: list[tuple[int, int]] = []
     room_cells: list[list[tuple[int, int]]] = []
@@ -420,14 +428,26 @@ def generate_tier_map(tier: int, seed: int, map_name: str = "MAP01") -> tuple[st
     twin_wall = rng.choice(WALL_TEXTURES) if tier >= 3 and rng.random() < 0.5 else None
 
     for idx, (mx, my) in enumerate(occupied):
-        rw = rng.randint(3, 5) if tier > 1 else rng.randint(5, 7)
-        rh = rng.randint(3, 5) if tier > 1 else rng.randint(5, 7)
+        rw = rng.randint(3, 6) if tier > 1 else rng.randint(5, 7)
+        rh = rng.randint(3, 6) if tier > 1 else rng.randint(5, 7)
         x0 = mx * 8
         y0 = my * 8
-        # Optional raised starting platform (walkable drop-off >24u) on room 0 in Tier 2/4
-        r_floor = 48 if (idx == 0 and tier in (2, 4) and rng.random() < 0.35) else 0
+        # Raised starting platform (walkable drop-off >24u) ONLY when room 0 has degree==1 (100% solvable!),
+        # otherwise use climbable +16u steps for height-variation training!
+        if idx == 0 and tier in (2, 4) and len(adj[0]) == 1 and rng.random() < 0.45:
+            r_floor = 48
+        elif idx > 0 and rng.random() < 0.20:
+            r_floor = rng.choice((0, 16))
+        else:
+            r_floor = 0
         cells = _carve_room(b, x0, y0, rw, rh, next_sec, rng, floor=r_floor, wall_tex=twin_wall)
-        if r_floor > 0:
+        # Interior cover pillar in larger non-spawn rooms (>=5x5, never blocking spawn or center!)
+        if idx > 0 and rw >= 5 and rh >= 5 and rng.random() < 0.35:
+            px_c, py_c = x0 + 1, y0 + 1
+            if (px_c, py_c) in b.cells and (px_c, py_c) != (x0 + rw // 2, y0 + rh // 2):
+                del b.cells[(px_c, py_c)]
+                cells = [c for c in cells if c != (px_c, py_c)]
+        if r_floor > 24:
             dropoff_cells.extend(cells)
         next_sec += 1
         room_centers.append((x0 + rw // 2, y0 + rh // 2))
@@ -435,11 +455,6 @@ def generate_tier_map(tier: int, seed: int, map_name: str = "MAP01") -> tuple[st
         room_floors.append(r_floor)
 
     # Identify tree depths from room 0 to place locks, keys, and exit on a guaranteed-solvable DAG
-    adj: dict[int, list[int]] = {i: [] for i in range(num_rooms)}
-    parent_of: dict[int, int] = {}
-    for p, c in edges:
-        adj[p].append(c)
-        parent_of[c] = p
     depth = {0: 0}
     bfs = [0]
     while bfs:
@@ -521,12 +536,18 @@ def generate_tier_map(tier: int, seed: int, map_name: str = "MAP01") -> tuple[st
                 {"lock": lock_id, "shuffled_tex": shuffle_tex, "pos": ((dpos[0] + 0.5) * CELL, (dpos[1] + 0.5) * CELL)}
             )
         if dtag > 0 and dpos is not None:
-            # Place remote switch on an outer wall of room u
+            # Place remote switch on an outer wall of room u with varied switch texture
+            sw_tex = rng.choice(SWITCH_TEXTURES)
             for gx, gy in room_cells[u]:
                 for dname, (dx, dy) in (("N", (0, 1)), ("S", (0, -1)), ("E", (1, 0)), ("W", (-1, 0))):
                     if (gx + dx, gy + dy) not in b.cells:
-                        b.add_switch(SwitchSpec(gx, gy, dname, special=12, tag=dtag, tex="SW1BRCOM"))
-                        switches_meta.append({"kind": "remote_door", "tag": dtag, "pos": ((gx + 0.5) * CELL, (gy + 0.5) * CELL)})
+                        b.add_switch(SwitchSpec(gx, gy, dname, special=12, tag=dtag, tex=sw_tex))
+                        switches_meta.append({
+                            "kind": "remote_door",
+                            "tag": dtag,
+                            "pos": ((gx + 0.5) * CELL, (gy + 0.5) * CELL),
+                            "door_pos": ((dpos[0] + 0.5) * CELL, (dpos[1] + 0.5) * CELL),
+                        })
                         break
                 if switches_meta:
                     break
@@ -535,16 +556,17 @@ def generate_tier_map(tier: int, seed: int, map_name: str = "MAP01") -> tuple[st
     px, py = room_centers[0]
     b.add_thing(px, py, THING_PLAYER, angle=rng.choice((0, 90, 180, 270)))
 
-    # Place Exit in exit_room: 50% walkover pad (GATE3), 50% wall switch (SW1EXIT)
+    # Place Exit in exit_room: 50% walkover pad, 50% wall switch (varied textures for zero-shot generalization!)
     exit_type = "walkover" if rng.random() < 0.55 else "switch"
     ex_cell = room_cells[exit_room][-1]
     exit_pos = ((ex_cell[0] + 0.5) * CELL, (ex_cell[1] + 0.5) * CELL)
     if exit_type == "switch":
         placed_sw = False
+        ex_sw_tex = rng.choice(SWITCH_TEXTURES)
         for gx, gy in reversed(room_cells[exit_room]):
             for dname, (dx, dy) in (("N", (0, 1)), ("E", (1, 0)), ("S", (0, -1)), ("W", (-1, 0))):
                 if (gx + dx, gy + dy) not in b.cells:
-                    b.add_switch(SwitchSpec(gx, gy, dname, special=243, tag=0, tex="SW1COMP"))
+                    b.add_switch(SwitchSpec(gx, gy, dname, special=243, tag=0, tex=ex_sw_tex))
                     exit_pos = ((gx + 0.5) * CELL, (gy + 0.5) * CELL)
                     switches_meta.append({"kind": "exit_switch", "pos": exit_pos})
                     placed_sw = True
@@ -554,7 +576,11 @@ def generate_tier_map(tier: int, seed: int, map_name: str = "MAP01") -> tuple[st
         if not placed_sw:
             exit_type = "walkover"
     if exit_type == "walkover":
-        b.set_cell(ex_cell[0], ex_cell[1], CellSpec(next_sec, floor=room_floors[exit_room], ceil=128, is_exit_pad=True))
+        b.set_cell(
+            ex_cell[0],
+            ex_cell[1],
+            CellSpec(next_sec, floor=room_floors[exit_room], ceil=128, floor_tex=rng.choice(EXIT_FLOOR_TEXTURES), is_exit_pad=True),
+        )
         next_sec += 1
 
     # Optional toxic nukage cell in Tier 2-4 (never on spawn or exit)
