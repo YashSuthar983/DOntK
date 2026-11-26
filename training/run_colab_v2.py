@@ -137,6 +137,7 @@ def main() -> None:
     _run([
         py, "training/eval_and_calibrate.py",
         "--weights", str(export),
+        "--suite", str(eval_manifest),
         "--device", args.device,
         "--out-json", str(ckpts / "eval_after_dagger.json"),
     ])
@@ -172,6 +173,7 @@ def main() -> None:
     _run([
         py, "training/eval_and_calibrate.py",
         "--weights", str(export),
+        "--suite", str(eval_manifest),
         "--device", args.device,
         "--calibrate",
         "--out-json", str(ckpts / "eval_final_report.json"),

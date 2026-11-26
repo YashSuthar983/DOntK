@@ -122,10 +122,9 @@ def run_level(
 ) -> dict:
     env = make_env(wad, map_name, episode_ticks=episode_ticks, render_buffers=True)
     if window:
-        # Re-open with visible window for live desktop viewing
+        # Re-open with visible window for live desktop viewing (keep 160x120 RGB-D buffers!)
         env._game.close()
         env._game.set_window_visible(True)
-        env._game.set_screen_resolution(vd.ScreenResolution.RES_640X480)
         env._game.init()
     try:
         obs, _ = env.reset(seed=seed)

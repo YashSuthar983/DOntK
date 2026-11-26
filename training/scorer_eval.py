@@ -123,6 +123,7 @@ def evaluate_agent_on_map(
                     unlocked_doors.add(int(sid))
 
         _update_trackers(env.privileged_state())
+        last_valid_tic = int(env.privileged_state()["tic"])
         steps = 0
         while True:
             t0 = time.perf_counter()
@@ -131,6 +132,8 @@ def evaluate_agent_on_map(
             obs, _, term, trunc, _ = env.step(action)
             steps += 1
             priv = env.privileged_state()
+            if int(priv["tic"]) > 0:
+                last_valid_tic = int(priv["tic"])
             _update_trackers(priv)
             if term or trunc:
                 break
@@ -138,7 +141,8 @@ def evaluate_agent_on_map(
         # Mirror docs/EVALUATION.md scoring buckets
         exit_reached = bool(priv["exit_reached"])
         dead = bool(priv["dead"])
-        tics_used = int(priv["tic"])
+        raw_tic = int(priv["tic"])
+        tics_used = raw_tic if raw_tic > 0 else min(episode_ticks, max(last_valid_tic + 4, steps * 4))
         health_end = max(0.0, float(priv["health"]))
         keys_collected = int(np.sum(priv["keys"] > 0.5))
         kills = int(priv["kills"])

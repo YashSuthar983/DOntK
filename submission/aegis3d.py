@@ -587,6 +587,8 @@ class AEGIS3D(nn.Module):
     def _apply_legal_masks(
         self, logits: list[torch.Tensor], prev_use: torch.Tensor, wpn_cd: torch.Tensor
     ) -> list[torch.Tensor]:
+        # Keep policy logits & legal mask math in FP32 so FP16 AMP never overflows on -1e9
+        logits = [lg.float() for lg in logits]
         if prev_use.any():
             use_mask = torch.zeros_like(logits[4])
             use_mask[..., 1] = torch.where(prev_use, torch.full_like(use_mask[..., 1], -1e9), torch.zeros_like(use_mask[..., 1]))

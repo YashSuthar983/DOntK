@@ -536,11 +536,14 @@ class FastDoomPackEnv:
         # Episode trackers
         self._prev_priv: dict | None = None
         self._prev_phi: float = 0.0
+        self._prev_subgoal: tuple[float, float] | None = None
         self._visited_cells: set[tuple[int, int]] = set()
         self._visited_grid: np.ndarray | None = None
         self._seen_grid: np.ndarray | None = None
         self._opened_doors: set[int] = set()
         self._unlocked_doors: set[int] = set()
+        self._rewarded_switch_use: set[tuple[int, int]] = set()
+        self._rewarded_dropoff: bool = False
         self._rng = np.random.default_rng(0)
 
     def _update_fog_of_war(self, obs: dict, priv: dict) -> None:
@@ -598,11 +601,15 @@ class FastDoomPackEnv:
         self._seen_grid = np.zeros((field.w, field.h), dtype=np.float32)
         self._opened_doors = set()
         self._unlocked_doors = set()
+        self._rewarded_switch_use = set()
+        self._rewarded_dropoff = False
         self._update_fog_of_war(obs, priv)
-        self._prev_phi = self._compute_phi(priv)
-        return obs, self._build_oracle_info(priv, info, odom_delta=(0.0, 0.0, 0.0, 1.0))
+        d_geo, sin_g, cos_g, subgoal, _ = self._query_subgoal(priv)
+        self._prev_subgoal = subgoal
+        self._prev_phi = self._phi_from_dist(d_geo)
+        return obs, self._build_oracle_info(priv, info, odom_delta=(0.0, 0.0, 0.0, 1.0), geo_res=(d_geo, sin_g, cos_g))
 
-    def _active_subgoal(self, priv: dict) -> tuple[float, float]:
+    def _active_subgoal_with_kind(self, priv: dict) -> tuple[tuple[float, float], str]:
         meta = self.manifest.get(self.current_map, {})
         keys_held = priv["keys"]
         lock_held = {
@@ -616,28 +623,51 @@ class FastDoomPackEnv:
         # Remote door switches if any remote door hasn't been opened yet
         for sw in meta.get("switches", []):
             if sw.get("kind") == "remote_door" and not self._remote_door_is_open(priv, sw):
-                return tuple(sw["pos"])
+                return (float(sw["pos"][0]), float(sw["pos"][1])), "remote_switch"
         for k in meta.get("keys_placed", []):
             if not lock_held.get(k["lock"], False):
-                return tuple(k["pos"])
+                return (float(k["pos"][0]), float(k["pos"][1])), "key"
         ex = meta.get("exit_pos")
         if ex is not None:
-            return tuple(ex)
-        return (priv["x"], priv["y"])
+            kind = "exit_switch" if meta.get("exit_type") == "switch" else "exit_walk"
+            return (float(ex[0]), float(ex[1])), kind
+        return (priv["x"], priv["y"]), "none"
+
+    def _active_subgoal(self, priv: dict) -> tuple[float, float]:
+        return self._active_subgoal_with_kind(priv)[0]
+
+    def _locked_blocked_grid(self, priv: dict) -> np.ndarray | None:
+        field = self._fields[self.current_map]
+        if not field.door_sectors:
+            return None
+        keys_held = priv["keys"]
+        blue = bool(keys_held[0] > 0.5 or keys_held[3] > 0.5)
+        yellow = bool(keys_held[1] > 0.5 or keys_held[4] > 0.5)
+        red = bool(keys_held[2] > 0.5 or keys_held[5] > 0.5)
+        floor, ceil = priv.get("sector_floor"), priv.get("sector_ceiling")
+        blocked = None
+        for sid, lock in field.door_sectors.items():
+            if lock <= 0:
+                continue
+            has_k = (red if lock in (129, 1) else (blue if lock in (130, 2) else (yellow if lock in (131, 3) else (red or blue or yellow))))
+            if has_k:
+                continue
+            if floor is not None and ceil is not None and 0 <= sid < len(floor) and (ceil[sid] - floor[sid]) >= 48.0:
+                continue
+            if blocked is None:
+                blocked = np.zeros((field.w, field.h), dtype=bool)
+            for cx, cy in field.door_cells.get(sid, []):
+                blocked[cx, cy] = True
+        return blocked
 
     def _remote_door_is_open(self, priv: dict, sw: dict) -> bool:
         """Check if the remote door associated with switch `sw` is open (or already visited)."""
-        # If player already walked within 72u of switch and opened doors increased, assume triggered
-        # Exact check via sector heights if door sector exists
         floor, ceil = priv.get("sector_floor"), priv.get("sector_ceiling")
         if floor is None or ceil is None:
             return True
-        # Check if any door sector with lock == 0 near non-manual door is open
         tag = sw.get("tag", 0)
         if tag == 0:
             return True
-        # In DoomForge, remote doors have door_lock == 0 and are NOT opened until switch is hit
-        # We check via manifest's remote_door_pos if available, otherwise sector heuristic
         rpos = sw.get("door_pos")
         if rpos is not None:
             field = self._fields[self.current_map]
@@ -645,19 +675,39 @@ class FastDoomPackEnv:
             sid = int(field.cell_sector[dcx, dcy])
             if 0 <= sid < len(floor):
                 return bool((ceil[sid] - floor[sid]) >= 48.0 or sid in self._opened_doors)
-        return False
+            return False
+        # Unmapped remote switches (e.g. binary Freedoom2): don't trap subgoal forever
+        return True
+
+    @staticmethod
+    def _phi_from_dist(d_geo: float) -> float:
+        return max(0.0, (4096.0 - d_geo) / 256.0) + 3.0 * math.exp(-d_geo / 180.0)
+
+    def _query_subgoal(self, priv: dict) -> tuple[float, float, float, tuple[float, float], str]:
+        field = self._fields[self.current_map]
+        heading = math.radians(priv["angle"])
+        subgoal, kind = self._active_subgoal_with_kind(priv)
+        blk = self._locked_blocked_grid(priv)
+        d_geo, sin_g, cos_g = field.geodesic_query(priv["x"], priv["y"], heading, subgoal, blocked_grid=blk)
+        return d_geo, sin_g, cos_g, subgoal, kind
 
     def _compute_phi(self, priv: dict) -> float:
-        field = self._fields[self.current_map]
-        heading = math.radians(priv["angle"])
-        d_geo, _, _ = field.geodesic_query(priv["x"], priv["y"], heading, self._active_subgoal(priv))
-        return max(0.0, (4096.0 - d_geo) / 256.0)
+        d_geo, _, _, _, _ = self._query_subgoal(priv)
+        return self._phi_from_dist(d_geo)
 
-    def _build_oracle_info(self, priv: dict, base_info: dict, odom_delta: tuple[float, float, float, float]) -> dict:
+    def _build_oracle_info(
+        self,
+        priv: dict,
+        base_info: dict,
+        odom_delta: tuple[float, float, float, float],
+        geo_res: tuple[float, float, float] | None = None,
+    ) -> dict:
         field = self._fields[self.current_map]
         heading = math.radians(priv["angle"])
-        subgoal = self._active_subgoal(priv)
-        d_geo, sin_g, cos_g = field.geodesic_query(priv["x"], priv["y"], heading, subgoal)
+        if geo_res is not None:
+            d_geo, sin_g, cos_g = geo_res
+        else:
+            d_geo, sin_g, cos_g, _, _ = self._query_subgoal(priv)
         meta = self.manifest.get(self.current_map, {})
 
         priv_vec = np.zeros(24, dtype=np.float32)
@@ -705,19 +755,28 @@ class FastDoomPackEnv:
         if not (term or trunc):
             self._update_fog_of_war(obs, priv)
 
-        # Scorer-aligned reward shaping (strong combat survival + progression + exit!)
-        reward = -0.002
+        # Scorer-aligned reward shaping (strong exit, progression, dropoff, switch & survival!)
+        eff_tic = int(priv["tic"])
+        if eff_tic <= 0 and prev["tic"] > 0:
+            eff_tic = min(self.episode_ticks, int(prev["tic"]) + 4)
+            priv["tic"] = eff_tic
+        reward = -0.004
         if priv["exit_reached"]:
-            hp_bonus = 4.0 * min(1.0, max(0.0, priv["health"]) / 100.0)
-            time_bonus = 4.0 * max(0.0, 1.0 - priv["tic"] / max(1, self.episode_ticks))
-            reward += 20.0 + hp_bonus + time_bonus
+            hp_bonus = 6.0 * min(1.0, max(0.0, priv["health"]) / 100.0)
+            time_bonus = 8.0 * max(0.0, 1.0 - eff_tic / max(1, self.episode_ticks))
+            reward += 35.0 + hp_bonus + time_bonus
         if priv["dead"]:
-            early_frac = max(0.0, 1.0 - priv["tic"] / max(1, self.episode_ticks))
-            reward -= 8.0 + 4.0 * early_frac
+            early_frac = max(0.0, 1.0 - eff_tic / max(1, self.episode_ticks))
+            reward -= 10.0 + 5.0 * early_frac
 
         new_keys = int(np.sum(priv["keys"] > 0.5) - np.sum(prev["keys"] > 0.5))
         if new_keys > 0:
-            reward += 5.0 * new_keys
+            reward += 7.0 * new_keys
+
+        # One-shot drop-off traversal bonus (teaches RGB-D 3D ledge drops despite fake RAY_WALL!)
+        if not self._rewarded_dropoff and (priv["z"] < prev["z"] - 24.0):
+            self._rewarded_dropoff = True
+            reward += 4.0
 
         floor, ceil, locks = priv["sector_floor"], priv["sector_ceiling"], priv["door_lock"]
         if floor is not None and ceil is not None and locks is not None:
@@ -729,7 +788,7 @@ class FastDoomPackEnv:
             for sid in np.flatnonzero(open_mask & (locks > 0)):
                 if int(sid) not in self._unlocked_doors:
                     self._unlocked_doors.add(int(sid))
-                    reward += 6.0
+                    reward += 12.0
 
         cell = (int(priv["x"] // 128), int(priv["y"] // 128))
         if cell not in self._visited_cells:
@@ -738,18 +797,29 @@ class FastDoomPackEnv:
 
         dkills = priv["kills"] - prev["kills"]
         if dkills > 0:
-            reward += 2.0 * dkills
+            reward += 2.5 * dkills
         ddmg = max(0.0, priv["damage_taken"] - prev["damage_taken"])
         if ddmg > 0:
-            reward -= 0.05 * ddmg
+            reward -= 0.055 * ddmg
 
-        phi = self._compute_phi(priv)
-        if new_keys == 0 and not term:
-            reward += 0.80 * (phi - self._prev_phi)
+        d_geo, sin_g, cos_g, subgoal, sub_kind = self._query_subgoal(priv)
+        # One-shot switch-USE discovery shaping when right next to an exit/remote switch
+        if sub_kind in ("exit_switch", "remote_switch") and action[7] > 0:
+            d_eu = math.hypot(subgoal[0] - priv["x"], subgoal[1] - priv["y"])
+            sw_key = (int(round(subgoal[0])), int(round(subgoal[1])))
+            if d_eu < 72.0 and sw_key not in self._rewarded_switch_use:
+                self._rewarded_switch_use.add(sw_key)
+                reward += 1.5
+
+        phi = self._phi_from_dist(d_geo)
+        # Avoid negative/positive jump when active subgoal transitions (e.g. key collected -> exit)
+        if subgoal == self._prev_subgoal and new_keys == 0 and not term:
+            reward += 0.90 * (phi - self._prev_phi)
+        self._prev_subgoal = subgoal
         self._prev_phi = phi
         self._prev_priv = priv
 
-        return obs, float(reward), term, trunc, self._build_oracle_info(priv, info, odom_delta)
+        return obs, float(reward), term, trunc, self._build_oracle_info(priv, info, odom_delta, geo_res=(d_geo, sin_g, cos_g))
 
     def close(self) -> None:
         self.env.close()

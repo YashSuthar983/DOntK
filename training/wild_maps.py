@@ -144,23 +144,34 @@ def _carve_wild_corridor(
     return door_pos
 
 
-def generate_wild_map(seed: int, map_name: str = "MAP01") -> tuple[str, GeneratedMapMeta]:
+def generate_wild_map(seed: int, map_name: str = "MAP01", *, skill_focus: bool = False) -> tuple[str, GeneratedMapMeta]:
     rng = random.Random(seed)
     b = GridUDMFBuilder()
     next_sec = 1
 
     tier = rng.choice((1, 2, 2, 3, 3, 4, 4))
-    num_rooms = rng.randint(3, 5) if tier == 1 else (rng.randint(5, 8) if tier == 2 else rng.randint(6, 11))
-    num_locks = 0 if tier <= 2 else (1 if tier == 3 else rng.choice((1, 2, 3)))
+    if skill_focus:
+        num_rooms = rng.randint(2, 4) if tier == 1 else (rng.randint(3, 5) if tier == 2 else rng.randint(4, 7))
+        num_locks = 0 if tier <= 2 else (1 if tier == 3 else rng.choice((1, 2)))
+    else:
+        num_rooms = rng.randint(3, 5) if tier == 1 else (rng.randint(5, 8) if tier == 2 else rng.randint(6, 11))
+        num_locks = 0 if tier <= 2 else (1 if tier == 3 else rng.choice((1, 2, 3)))
 
     # Coarse macro-grid spaced by 10 cells (640u) so rooms can be up to 8x8 open arenas!
     occupied: list[tuple[int, int]] = [(0, 0)]
     edges: list[tuple[int, int]] = []
+    want_spawn_dropoff = skill_focus and (rng.random() < 0.35)
     while len(occupied) < num_rooms:
-        p_idx = rng.randrange(len(occupied))
+        # If we want a clean 1-exit spawn dropoff, never attach a 2nd child to room 0
+        if want_spawn_dropoff and len(occupied) >= 2:
+            p_idx = rng.randrange(1, len(occupied))
+        else:
+            p_idx = rng.randrange(len(occupied))
         px, py = occupied[p_idx]
         nbrs = [(px + dx, py + dy) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)) if (px + dx, py + dy) not in occupied]
         if not nbrs:
+            if want_spawn_dropoff and len(occupied) >= 2:
+                want_spawn_dropoff = False
             continue
         c_idx = len(occupied)
         occupied.append(rng.choice(nbrs))
@@ -182,7 +193,7 @@ def generate_wild_map(seed: int, map_name: str = "MAP01") -> tuple[str, Generate
         rh = rng.randint(4, 8)
         x0 = mx * 10
         y0 = my * 10
-        if idx == 0 and len(adj[0]) == 1 and rng.random() < 0.25:
+        if idx == 0 and len(adj[0]) == 1 and (want_spawn_dropoff or rng.random() < 0.25):
             r_floor = 48
         elif idx > 0 and rng.random() < 0.30:
             r_floor = rng.choice((0, 16))
@@ -316,7 +327,7 @@ def generate_wild_map(seed: int, map_name: str = "MAP01") -> tuple[str, Generate
     px, py = room_centers[0]
     b.add_thing(px, py, THING_PLAYER, angle=rng.choice((0, 45, 90, 135, 180, 225, 270, 315)))
 
-    exit_type = "walkover" if rng.random() < 0.50 else "switch"
+    exit_type = "walkover" if rng.random() < (0.40 if skill_focus else 0.50) else "switch"
     ex_cell = room_cells[exit_room][-1]
     exit_pos = ((ex_cell[0] + 0.5) * CELL, (ex_cell[1] + 0.5) * CELL)
     if exit_type == "switch":
@@ -380,14 +391,14 @@ def generate_wild_map(seed: int, map_name: str = "MAP01") -> tuple[str, Generate
     return b.compile_textmap(), meta
 
 
-def build_wild_pack(out_wad: str | Path, num_maps: int = 120, base_seed: int = 77000) -> Path:
+def build_wild_pack(out_wad: str | Path, num_maps: int = 120, base_seed: int = 77000, *, skill_focus: bool = False) -> Path:
     out_wad = Path(out_wad)
     out_wad.parent.mkdir(parents=True, exist_ok=True)
     lumps: list[Lump] = []
     manifest: list[dict] = []
     for i in range(num_maps):
         mname = f"MAP{i + 1:02d}"
-        textmap, meta = generate_wild_map(seed=base_seed + i, map_name=mname)
+        textmap, meta = generate_wild_map(seed=base_seed + i, map_name=mname, skill_focus=skill_focus)
         lumps.append(Lump(mname, b""))
         lumps.append(Lump("TEXTMAP", textmap.encode("utf-8")))
         lumps.append(Lump("ENDMAP", b""))
@@ -400,5 +411,7 @@ def build_wild_pack(out_wad: str | Path, num_maps: int = 120, base_seed: int = 7
 if __name__ == "__main__":
     p = build_wild_pack("training/wads/train/wild_train.wad", num_maps=120, base_seed=77000)
     print(f"Built 120 WildForge diverse maps -> {p}")
+    p_sk = build_wild_pack("training/wads/train/skills_train.wad", num_maps=160, base_seed=60000, skill_focus=True)
+    print(f"Built 160 WildForge skill-dense OOD maps (dropoffs/switches/locks) -> {p_sk}")
     p_eval = build_wild_pack("training/wads/eval_wild/wild_eval.wad", num_maps=20, base_seed=88000)
     print(f"Built 20 WildForge unseen OOD eval maps -> {p_eval}")

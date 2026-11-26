@@ -96,6 +96,7 @@ class DoomEnv(gym.Env):
         self._last_obs: dict | None = None
         self._last_vars: np.ndarray | None = None
         self._last_sectors = None
+        self._last_tic = 0
         self._exit_reached = False
         self._closed = False
 
@@ -113,6 +114,7 @@ class DoomEnv(gym.Env):
         if self._geometry is None:
             self._geometry = LevelGeometry(state.sectors, self.mapinfo)
             self._sensors = Sensors(self._geometry)
+        self._last_tic = int(g.get_episode_time())
         self._exit_reached = False
         obs = self._observe(state, first=True)
         return obs, self._info()
@@ -142,7 +144,14 @@ class DoomEnv(gym.Env):
             obs = self._last_obs  # engine has no state after the episode ends
             # ...but game variables are still readable: keep kills/damage/health from the final tics.
             self._last_vars = np.array([g.get_game_variable(v) for v in GAME_VARIABLES], np.float64)
+            end_tic = int(g.get_episode_time())
+            # ViZDoom resets episode_time to 0 on level exit: retain last valid tic (+ FRAME_SKIP).
+            if end_tic > 0:
+                self._last_tic = end_tic
+            else:
+                self._last_tic = min(self.episode_ticks, self._last_tic + S.FRAME_SKIP)
         else:
+            self._last_tic = int(g.get_episode_time())
             obs = self._observe(g.get_state())
         reward += 0.1 * float(self._last_vars[_V[GV.KILLCOUNT]] - kills_before)
         return obs, reward, terminated, truncated, self._info()
@@ -197,7 +206,8 @@ class DoomEnv(gym.Env):
         return obs
 
     def _info(self) -> dict:
-        return {"tic": int(self._game.get_episode_time()), "exit_reached": self._exit_reached}
+        tic = int(self._game.get_episode_time())
+        return {"tic": tic if tic > 0 else self._last_tic, "exit_reached": self._exit_reached}
 
     # ------------------------------------------------------------------ scorer / training only
     def privileged_state(self) -> dict:
@@ -205,8 +215,11 @@ class DoomEnv(gym.Env):
         g = self._game
         v = self._last_vars
         finished = g.is_episode_finished()
+        tic = int(g.get_episode_time())
+        if tic > 0:
+            self._last_tic = tic
         return {
-            "tic": int(g.get_episode_time()),
+            "tic": tic if tic > 0 else self._last_tic,
             "episode_ticks": self.episode_ticks,
             "x": float(v[_V[GV.POSITION_X]]),
             "y": float(v[_V[GV.POSITION_Y]]),

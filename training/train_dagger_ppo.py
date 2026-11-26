@@ -107,15 +107,9 @@ def _worker_loop(conn, wad_paths: list[str], episode_ticks: int, gamma: float, s
                 rews = np.zeros(len(envs), dtype=np.float32)
                 dones = np.zeros(len(envs), dtype=np.float32)
                 exits = np.zeros(len(envs), dtype=np.float32)
-                odom_t = np.zeros((len(envs), 4), dtype=np.float32)
-                bev_t = np.zeros((len(envs), 6, BEV_SIZE, BEV_SIZE), dtype=np.float32)
-                aff_t = np.zeros((len(envs), AFFORD_COLS, 5), dtype=np.float32)
                 for i, e in enumerate(envs):
                     o, r, term, trunc, inf = e.step(acts_mb[i])
                     rews[i] = r
-                    odom_t[i] = inf["odom_target"]
-                    bev_t[i] = inf["bev_target"]
-                    aff_t[i] = inf["afford_target"]
                     if term or trunc:
                         dones[i] = 1.0
                         exits[i] = 1.0 if inf.get("exit_reached") else 0.0
@@ -127,10 +121,6 @@ def _worker_loop(conn, wad_paths: list[str], episode_ticks: int, gamma: float, s
                     obs_l.append(o)
                     inf_l.append(inf)
                 pkt = _pack(obs_l, inf_l, o_acts, rews, dones, exits)
-                # Preserve the pre-reset targets for step t's grounding loss!
-                pkt["odom_target"] = odom_t
-                pkt["bev_target"] = bev_t
-                pkt["afford_target"] = aff_t
                 conn.send(pkt)
             elif cmd == "close":
                 break
@@ -320,8 +310,10 @@ def _grounding_loss(
     done_seq: torch.Tensor,
     aff_pos_weight: torch.Tensor,
 ) -> torch.Tensor:
-    # 1. Odometry SmoothL1
-    l_odom = F.smooth_l1_loss(extras["odom"].float(), odom_tgt.float())
+    # 1. Balanced SE(2) Odometry SmoothL1 (equal scale for translation/16 and sharp angular heading!)
+    l_odom_xy = F.smooth_l1_loss(extras["odom"][..., :2].float() / 16.0, odom_tgt[..., :2].float() / 16.0)
+    l_odom_ang = F.smooth_l1_loss(extras["odom"][..., 2:4].float(), odom_tgt[..., 2:4].float(), beta=0.1)
+    l_odom = l_odom_xy + 4.0 * l_odom_ang
 
     # 2. Observed-Only Masked 32x32 BEV BCE (zero hallucination behind walls!)
     L, B = done_seq.shape
@@ -346,7 +338,7 @@ def _grounding_loss(
                 l_idm = l_idm + F.cross_entropy(head(idm_in).float(), act_f[:-1, :, i].reshape(-1)[keep])
             l_idm = l_idm / len(model.e3b_idm)
 
-    return l_odom + 2.0 * l_bev + l_aff + 0.35 * l_idm
+    return 2.0 * l_odom + 2.0 * l_bev + l_aff + 0.35 * l_idm
 
 
 # ---------------------------------------------------------------------------
@@ -378,10 +370,12 @@ def main() -> None:
     ap.add_argument("--device", default="auto")
     ap.add_argument("--save", default="training/checkpoints/aegis_v2.pt")
     ap.add_argument("--resume", default=None)
+    ap.add_argument("--init-policy", default=None, help="Optional stripped policy checkpoint overlaid after --resume (keeps warmed critic/aux!)")
     ap.add_argument("--reset-step", action="store_true", help="Load weights only from --resume and start step/beta/LR from 0")
     ap.add_argument("--anchor-ckpt", default=None, help="Frozen DAgger anchor checkpoint for PPO KL")
     ap.add_argument("--export-submission", default="submission/weights/aegis3d.pt")
     ap.add_argument("--save-every", type=int, default=15)
+    ap.add_argument("--milestone-every", type=int, default=250000, help="Save stripped milestone copy every N steps")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -411,6 +405,12 @@ def main() -> None:
             global_step = int(ckpt.get("global_step", 0))
             update_idx = int(ckpt.get("update_idx", 0))
         print(f"[AEGIS-3D v2] Resumed from {args.resume} (prev_mode={ckpt.get('mode')}, reset_step={args.reset_step}, step={global_step:,})", flush=True)
+
+    if args.init_policy and Path(args.init_policy).is_file():
+        pckpt = torch.load(args.init_policy, map_location=device, weights_only=False)
+        psd = pckpt["model"] if isinstance(pckpt, dict) and "model" in pckpt else pckpt
+        model.load_state_dict(psd, strict=False)
+        print(f"[AEGIS-3D v2] Overlaid policy/backbone weights <- {args.init_policy}", flush=True)
 
     anchor: AEGIS3D | None = None
     if args.mode == "ppo" and args.anchor_ckpt and Path(args.anchor_ckpt).is_file():
@@ -466,6 +466,7 @@ def main() -> None:
     ep_exits: list[float] = []
     ep_returns = np.zeros(N, dtype=np.float64)
     recent_returns: list[float] = []
+    next_milestone = ((global_step // max(1, args.milestone_every)) + 1) * args.milestone_every if args.milestone_every > 0 else 0
     t_start = time.perf_counter()
 
     try:
@@ -536,6 +537,10 @@ def main() -> None:
                     buf_since_use[t] = state.steps_since_use
                     buf_priv[t] = priv_t
                     buf_oracle[t] = oracle_t
+                    # Issue #6 fix: align odom/BEV/affordance grounding targets with observation t (from the SAME packet!)
+                    buf_odom[t] = torch.from_numpy(pkt["odom_target"]).to(device, non_blocking=True)
+                    buf_bev[t] = torch.from_numpy(pkt["bev_target"]).to(device, non_blocking=True)
+                    buf_aff[t] = torch.from_numpy(pkt["afford_target"]).to(device, non_blocking=True)
 
                     with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                         s_logits, next_state, extras = model.forward_step(obs_t, state)
@@ -584,9 +589,6 @@ def main() -> None:
                     done_t = torch.from_numpy(done_np).to(device, non_blocking=True)
                     buf_rew[t] = torch.from_numpy(rew_np).to(device, non_blocking=True)
                     buf_done[t] = done_t
-                    buf_odom[t] = torch.from_numpy(pkt["odom_target"]).to(device, non_blocking=True)
-                    buf_bev[t] = torch.from_numpy(pkt["bev_target"]).to(device, non_blocking=True)
-                    buf_aff[t] = torch.from_numpy(pkt["afford_target"]).to(device, non_blocking=True)
 
                     state = _reset_masked_state(next_state, done_t, fresh_N)
                     if next_a_state is not None:
@@ -699,14 +701,11 @@ def main() -> None:
                             surr1 = ratio * mb_adv
                             surr2 = torch.clamp(ratio, 1.0 - args.clip_eps, 1.0 + args.clip_eps) * mb_adv
                             l_ppo = -torch.min(surr1, surr2).mean()
-                            # Clipped value loss for PPO stability
-                            v_clip = val_c[:, idx] + torch.clamp(val_new.float() - val_c[:, idx], -0.5, 0.5)
-                            l_val = 0.5 * torch.max(
-                                (val_new.float() - ret_c[:, idx]).pow(2),
-                                (v_clip - ret_c[:, idx]).pow(2),
-                            ).mean()
+                            # Huber/SmoothL1 value loss so +49 exit jackpots NEVER crush PPO policy gradients!
+                            l_val = F.smooth_l1_loss(val_new.float(), ret_c[:, idx].float(), beta=2.0)
+                            cur_ent_coef = args.ent_coef * (0.4 + 0.6 * (1.0 - progress))
                             l_kl = _kl_factored([a[:, idx] for a in anchor_c], s_logits) if anchor_c is not None else torch.zeros((), device=device)
-                            loss = l_ppo + 0.5 * l_val - args.ent_coef * ent_mean + kl_beta * l_kl + args.ground_coef * l_ground
+                            loss = l_ppo + 0.25 * l_val - cur_ent_coef * ent_mean + kl_beta * l_kl + args.ground_coef * l_ground
                             l_ce = torch.zeros((), device=device)
                             l_ppo_v, l_kl_v, ent_v = float(l_ppo.item()), float(l_kl.item()), float(ent_mean.item())
 
@@ -760,8 +759,14 @@ def main() -> None:
                 tmp.replace(save_path)
                 if export_path is not None:
                     etmp = export_path.with_suffix(".tmp")
-                    torch.save({"model": model.strip_for_submission()}, etmp)
+                    stripped = model.strip_for_submission()
+                    torch.save({"model": stripped}, etmp)
                     etmp.replace(export_path)
+                    if next_milestone > 0 and global_step >= next_milestone:
+                        mpath = save_path.parent / f"{save_path.stem}_{global_step // 1000}k.pt"
+                        torch.save({"model": stripped}, mpath)
+                        print(f"[AEGIS-3D v2] Milestone -> {mpath}", flush=True)
+                        next_milestone += args.milestone_every
                 print(f"[AEGIS-3D v2] Saved -> {save_path} | Exported -> {export_path}", flush=True)
     finally:
         vec_env.close()
