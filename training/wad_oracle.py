@@ -24,9 +24,9 @@ import numpy as np
 
 from doom_env import make_env
 from doom_env import spaces as S
-from doom_env.mapinfo import load_mapinfo, parse_udmf
-from doom_env.sensors import ego_rotate
-from doom_env.wad import list_maps, map_lumps, read_wad
+from doom_env.mapinfo import _sector_tags, load_mapinfo, parse_udmf
+from doom_env.sensors import LevelGeometry, PLAYER_HEIGHT, _ray_line_t, ego_rotate
+from doom_env.wad import Lump, list_maps, map_lumps, read_wad
 
 GRID_CELL = 64.0
 BEV_SIZE = 32
@@ -375,22 +375,26 @@ class GridGeodesicField:
         return bev
 
 
-def _frustum_affordance(px: float, py: float, heading: float, meta: dict, n_cols: int = AFFORD_COLS) -> np.ndarray:
+def _frustum_affordance(
+    px: float, py: float, heading: float, meta: dict, n_cols: int = AFFORD_COLS, *,
+    geometry: LevelGeometry | None = None, field: GridGeodesicField | None = None,
+) -> np.ndarray:
     """Project known exit / switch / lock_color points into horizontal 90-deg FOV columns (n_cols, 5)."""
     # Channels: 0=exit, 1=switch, 2=lock_red, 3=lock_blue, 4=lock_yellow
     out = np.zeros((n_cols, 5), dtype=np.float32)
+    candidates = []
 
-    def _mark(tx: float, ty: float, ch: int, max_d: float = 1024.0) -> None:
+    def _mark(tx: float, ty: float, ch: int, visible_door: int = -1) -> None:
         dx, dy = tx - px, ty - py
         d = math.hypot(dx, dy)
-        if d < 1e-3 or d > max_d:
+        if d < 1e-3 or d > S.RAY_RANGE:
             return
         rel = (math.atan2(dy, dx) - heading + math.pi) % (2.0 * math.pi) - math.pi
         if abs(rel) > math.radians(45.0):
             return
         u_frac = 0.5 - rel / math.radians(90.0)
         col = int(np.clip(round(u_frac * (n_cols - 1)), 0, n_cols - 1))
-        out[col, ch] = 1.0
+        candidates.append((col, ch, d, dx / d, dy / d, visible_door))
 
     ex = meta.get("exit_pos")
     if ex is not None:
@@ -401,11 +405,45 @@ def _frustum_affordance(px: float, py: float, heading: float, meta: dict, n_cols
     for ld in meta.get("locked_doors", []):
         ch = lock_to_ch.get(ld["lock"])
         if ch is not None:
-            _mark(ld["pos"][0], ld["pos"][1], ch)
+            tx, ty = ld["pos"]
+            sid = int(field.cell_sector[field.world_to_cell(tx, ty)]) if field is not None else -1
+            target_door = sid if field is not None and field.door_sectors.get(sid, 0) > 0 else -1
+            _mark(tx, ty, ch, visible_door=target_door)
+
+    if not candidates:
+        return out
+    if geometry is None:
+        for col, ch, *_ in candidates:
+            out[col, ch] = 1.0
+        return out
+
+    lines = geometry.nearby(px, py, max(candidate[2] for candidate in candidates))
+    lines = lines[geometry.sight_block[lines]]
+    distances = _ray_line_t(
+        np.array([px, py]), np.array([(c[3], c[4]) for c in candidates]),
+        geometry.p1[lines], geometry.p2[lines],
+    )
+    # A generated lock is labeled at its center. Its own front face is visible.
+    for (col, ch, d, _, _, target_door), hits in zip(candidates, distances):
+        if not len(hits) or hits.min() >= d - 1e-4:
+            out[col, ch] = 1.0
+        elif target_door >= 0:
+            line = lines[hits.argmin()]
+            if target_door in (geometry.sec_a[line], geometry.sec_b[line]):
+                out[col, ch] = 1.0
     return out
 
 
-def _auto_extract_manifest(lumps: dict[str, bytes], map_names: list[str]) -> dict[str, dict]:
+def _udmf_sector_tags(blocks: dict) -> dict[int, list[int]]:
+    tags: dict[int, list[int]] = {}
+    for sid, sector in enumerate(blocks.get("sector", [])):
+        tag = int(sector.get("id", 0))
+        if tag:
+            tags.setdefault(tag, []).append(sid)
+    return tags
+
+
+def _auto_extract_manifest(lumps: list[Lump], map_names: list[str]) -> dict[str, dict]:
     """Auto-extract keys, switches, locked doors & exits from UDMF or binary Doom WADs."""
     key_lock_map = {13: 129, 38: 129, 5: 130, 40: 130, 6: 131, 39: 131}
     manifest: dict[str, dict] = {}
@@ -417,8 +455,10 @@ def _auto_extract_manifest(lumps: dict[str, bytes], map_names: list[str]) -> dic
         ex_pos = None
         ex_type = "switch"
 
+        tagged_sectors: dict[int, list[int]] = {}
         if "TEXTMAP" in ml:
             b = parse_udmf(ml["TEXTMAP"].decode("utf-8", "replace"))
+            tagged_sectors = _udmf_sector_tags(b)
             verts = [(float(v.get("x", 0.0)), float(v.get("y", 0.0))) for v in b.get("vertex", [])]
             for th in b.get("thing", []):
                 tid = int(th.get("type", 0) or 0)
@@ -444,6 +484,7 @@ def _auto_extract_manifest(lumps: dict[str, bytes], map_names: list[str]) -> dic
                 elif spec in (13, 14) and int(ln.get("arg3", 0) or 0) > 0:
                     locked_doors.append({"lock": int(ln.get("arg3", 0)), "pos": [mx, my]})
         else:
+            _, tagged_sectors = _sector_tags(ml.get("SECTORS", b""))
             th = ml.get("THINGS", b"")
             for i in range(0, len(th) - 9, 10):
                 tx, ty, _ang, tid, _fl = struct.unpack_from("<hhHHH", th, i)
@@ -469,6 +510,9 @@ def _auto_extract_manifest(lumps: dict[str, bytes], map_names: list[str]) -> dic
                 elif spec in (29, 61, 63, 103, 111, 112, 114, 115) and tag > 0:
                     switches.append({"kind": "remote_door", "tag": int(tag), "pos": [mx, my]})
 
+        for switch in switches:
+            if switch["kind"] == "remote_door":
+                switch["door_sectors"] = tagged_sectors.get(switch["tag"], [])
         manifest[m.upper()] = {
             "map_name": m.upper(),
             "keys_placed": keys_placed,
@@ -511,7 +555,20 @@ class FastDoomPackEnv:
         self.manifest: dict[str, dict] = {}
         if manifest_path.is_file():
             for entry in json.loads(manifest_path.read_text(encoding="utf-8")):
-                self.manifest[entry["map_name"].upper()] = entry
+                name = entry["map_name"].upper()
+                self.manifest[name] = entry
+                # Older sidecars may contain only a remote switch tag.
+                unresolved = [sw for sw in entry.get("switches", []) if sw.get("kind") == "remote_door"
+                              and sw.get("tag") and not sw.get("door_sectors") and sw.get("door_pos") is None]
+                if unresolved and name in self.map_names:
+                    ml = map_lumps(lumps, name)
+                    if "TEXTMAP" in ml:
+                        blocks = parse_udmf(ml["TEXTMAP"].decode("utf-8", "replace"))
+                        tags = _udmf_sector_tags(blocks)
+                    else:
+                        _, tags = _sector_tags(ml.get("SECTORS", b""))
+                    for sw in unresolved:
+                        sw["door_sectors"] = tags.get(sw["tag"], [])
         else:
             self.manifest = _auto_extract_manifest(lumps, self.map_names)
 
@@ -543,6 +600,8 @@ class FastDoomPackEnv:
         self._opened_doors: set[int] = set()
         self._unlocked_doors: set[int] = set()
         self._rewarded_switch_use: set[tuple[int, int]] = set()
+        self._use_down = False
+        self._previous_clearance: np.ndarray | None = None
         self._rewarded_dropoff: bool = False
         self._rng = np.random.default_rng(0)
 
@@ -602,6 +661,8 @@ class FastDoomPackEnv:
         self._opened_doors = set()
         self._unlocked_doors = set()
         self._rewarded_switch_use = set()
+        self._use_down = False
+        self._previous_clearance = None
         self._rewarded_dropoff = False
         self._update_fog_of_war(obs, priv)
         d_geo, sin_g, cos_g, subgoal, _ = self._query_subgoal(priv)
@@ -660,24 +721,50 @@ class FastDoomPackEnv:
                 blocked[cx, cy] = True
         return blocked
 
-    def _remote_door_is_open(self, priv: dict, sw: dict) -> bool:
-        """Check if the remote door associated with switch `sw` is open (or already visited)."""
-        floor, ceil = priv.get("sector_floor"), priv.get("sector_ceiling")
-        if floor is None or ceil is None:
-            return True
-        tag = sw.get("tag", 0)
-        if tag == 0:
-            return True
-        rpos = sw.get("door_pos")
-        if rpos is not None:
+    def _remote_sectors(self, sw: dict) -> list[int]:
+        if sw.get("door_sectors"):
+            return sw["door_sectors"]
+        # Generated and older manifests store the door position.
+        if sw.get("door_pos") is not None:
             field = self._fields[self.current_map]
-            dcx, dcy = field.world_to_cell(rpos[0], rpos[1])
-            sid = int(field.cell_sector[dcx, dcy])
-            if 0 <= sid < len(floor):
-                return bool((ceil[sid] - floor[sid]) >= 48.0 or sid in self._opened_doors)
+            sid = int(field.cell_sector[field.world_to_cell(*sw["door_pos"])])
+            if sid >= 0:
+                return [sid]
+        return []
+
+    def _remote_door_is_open(self, priv: dict, sw: dict) -> bool:
+        """Whether a linked opening is traversable or has already been credited."""
+        floor, ceil = priv.get("sector_floor"), priv.get("sector_ceiling")
+        targets = self._remote_sectors(sw)
+        if floor is None or ceil is None or not targets:
+            return True
+        return any(0 <= sid < len(floor) and (
+            ceil[sid] - floor[sid] >= PLAYER_HEIGHT or sid in self._opened_doors
+        ) for sid in targets)
+
+    def _switch_activated(self, before: dict, after: dict) -> bool:
+        """Credit a USE edge only when its switch produces an engine event."""
+        meta = self.manifest.get(self.current_map, {})
+        if after["exit_reached"] and meta.get("exit_type") == "switch":
+            return True
+        if any(state.get(key) is None for state in (before, after) for key in ("sector_floor", "sector_ceiling")):
             return False
-        # Unmapped remote switches (e.g. binary Freedoom2): don't trap subgoal forever
-        return True
+        for switch in meta.get("switches", []):
+            if switch["kind"] != "remote_door":
+                continue
+            x, y = switch["pos"]
+            key = (int(round(x)), int(round(y)))
+            if key in self._rewarded_switch_use or math.hypot(x - before["x"], y - before["y"]) >= 72.0:
+                continue
+            for sid in self._remote_sectors(switch):
+                if 0 <= sid < len(before["sector_floor"]):
+                    old = before["sector_ceiling"][sid] - before["sector_floor"][sid]
+                    new = after["sector_ceiling"][sid] - after["sector_floor"][sid]
+                    was_opening = self._previous_clearance is not None and old > self._previous_clearance[sid]
+                    if old < PLAYER_HEIGHT and new > old and not was_opening:
+                        self._rewarded_switch_use.add(key)
+                        return True
+        return False
 
     @staticmethod
     def _phi_from_dist(d_geo: float) -> float:
@@ -733,7 +820,9 @@ class FastDoomPackEnv:
             "geodesic_dist": d_geo,
         }
         if self.compute_spatial_targets and self._seen_grid is not None and self._visited_grid is not None:
-            out["afford_target"] = _frustum_affordance(priv["x"], priv["y"], heading, meta, n_cols=AFFORD_COLS)
+            out["afford_target"] = _frustum_affordance(
+                priv["x"], priv["y"], heading, meta, n_cols=AFFORD_COLS, geometry=self.env._geometry, field=field
+            )
             out["bev_target"] = field.ego_bev_ground_truth(
                 priv["x"], priv["y"], heading, self._seen_grid, self._visited_grid
             )
@@ -802,14 +891,11 @@ class FastDoomPackEnv:
         if ddmg > 0:
             reward -= 0.055 * ddmg
 
-        d_geo, sin_g, cos_g, subgoal, sub_kind = self._query_subgoal(priv)
-        # One-shot switch-USE discovery shaping when right next to an exit/remote switch
-        if sub_kind in ("exit_switch", "remote_switch") and action[7] > 0:
-            d_eu = math.hypot(subgoal[0] - priv["x"], subgoal[1] - priv["y"])
-            sw_key = (int(round(subgoal[0])), int(round(subgoal[1])))
-            if d_eu < 72.0 and sw_key not in self._rewarded_switch_use:
-                self._rewarded_switch_use.add(sw_key)
-                reward += 1.5
+        use_down = bool(action[7])
+        if use_down and not self._use_down and self._switch_activated(prev, priv):
+            reward += 1.5
+        self._use_down = use_down
+        d_geo, sin_g, cos_g, subgoal, _ = self._query_subgoal(priv)
 
         phi = self._phi_from_dist(d_geo)
         # Avoid negative/positive jump when active subgoal transitions (e.g. key collected -> exit)
@@ -817,6 +903,8 @@ class FastDoomPackEnv:
             reward += 0.90 * (phi - self._prev_phi)
         self._prev_subgoal = subgoal
         self._prev_phi = phi
+        if prev["sector_floor"] is not None and prev["sector_ceiling"] is not None:
+            self._previous_clearance = prev["sector_ceiling"] - prev["sector_floor"]
         self._prev_priv = priv
 
         return obs, float(reward), term, trunc, self._build_oracle_info(priv, info, odom_delta, geo_res=(d_geo, sin_g, cos_g))

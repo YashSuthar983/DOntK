@@ -21,15 +21,13 @@ class ObjectiveOracle(FrontierOracle):
             return blocked
         field = env._fields[env.current_map]
         for switch in env.manifest.get(env.current_map, {}).get("switches", []):
-            door_pos = switch.get("door_pos")
-            if door_pos is None:
+            if switch.get("kind") != "remote_door":
                 continue
-            cell = field.world_to_cell(*door_pos)
-            sector = field.cell_sector[cell]
-            if 0 <= sector < len(floor):
-                closed = ceiling[sector] - floor[sector] < PLAYER_HEIGHT
-                for door_cell in field.door_cells.get(sector, (cell,)):
-                    blocked[door_cell] = closed
+            for sector in env._remote_sectors(switch):
+                if 0 <= sector < len(floor):
+                    closed = ceiling[sector] - floor[sector] < PLAYER_HEIGHT
+                    for cell in field.door_cells.get(sector, ()):
+                        blocked[cell] = closed
         return blocked
 
     def _select_nav_target(
@@ -55,9 +53,9 @@ class ObjectiveOracle(FrontierOracle):
         for switch in meta.get("switches", []):
             if switch.get("kind") != "remote_door":
                 continue
-            door_pos = switch.get("door_pos")
-            if door_pos is not None:
-                if not blocked[field.world_to_cell(*door_pos)]:
+            door_cells = [cell for sector in env._remote_sectors(switch) for cell in field.door_cells.get(sector, ())]
+            if door_cells:
+                if not any(blocked[cell] for cell in door_cells):
                     continue
             elif field.world_to_cell(*switch["pos"]) in self.triggered_switches:
                 continue
