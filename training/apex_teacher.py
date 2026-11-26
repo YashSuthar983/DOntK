@@ -30,6 +30,7 @@ BARREL_TYPE = 10
 
 USE_COOLDOWN_DOOR = 18  # ~2s at 8.75 Hz so USE never reverses a rising door
 USE_COOLDOWN_SWITCH = 4
+USE_RANGE = 64.0
 AIM_DEADBAND_DEG = 6.0
 TURN_START_DEG = 9.0
 ROTATE_IN_PLACE_DEG = 45.0
@@ -446,24 +447,22 @@ class ApexTeacher(FrontierOracle):
         # ------------------------------------------------------------------
         # 2. Door wait / switch interaction / navigation
         # ------------------------------------------------------------------
-        ahead_x = px + math.cos(heading) * 52.0
-        ahead_y = py + math.sin(heading) * 52.0
-        ahead_cell = field.world_to_cell(ahead_x, ahead_y)
+        # Resolve the sector just behind the face hit by Doom's forward USE trace.
+        center_hits_door = int(rht[0]) in (RAY_DOOR, RAY_LOCKED)
+        center_door_d = float(rd[0]) if center_hits_door else math.inf
+        reach = min(center_door_d, USE_RANGE) + 4.0
+        ahead_cell = field.world_to_cell(px + math.cos(heading) * reach, py + math.sin(heading) * reach)
         ahead_sid = int(field.cell_sector[ahead_cell])
         floor_arr, ceil_arr = priv.get("sector_floor"), priv.get("sector_ceiling")
-        ahead_is_door_sector = ahead_sid in field.door_sectors
-        ahead_is_opening = False
-        if ahead_is_door_sector and floor_arr is not None and ceil_arr is not None and 0 <= ahead_sid < len(floor_arr):
-            ahead_is_opening = (ceil_arr[ahead_sid] - floor_arr[ahead_sid]) > 12.0
-
-        center_hits_door = int(rht[0]) in (RAY_DOOR, RAY_LOCKED)
-        center_door_d = float(rd[0]) if center_hits_door else 9999.0
-        can_open_front_door = (
-            center_hits_door
-            and center_door_d < 92.0
-            and (int(rht[0]) == RAY_DOOR or not blocked[ahead_cell])
-            and not ahead_is_opening
+        ahead_is_opening = (
+            ahead_sid in field.door_sectors
+            and floor_arr is not None
+            and ceil_arr is not None
+            and 0 <= ahead_sid < len(floor_arr)
+            and ceil_arr[ahead_sid] - floor_arr[ahead_sid] > 12.0
         )
+        can_open_front_door = center_door_d <= USE_RANGE and not blocked[ahead_cell] and not ahead_is_opening
+        press_door = can_open_front_door and not self.prev_use and self.use_cooldown == 0
 
         # Switch interaction (exit switch or remote door switch)
         if nav_kind in ("exit_switch", "remote_switch") and target_xy is not None and target_cell is not None:
@@ -488,7 +487,7 @@ class ApexTeacher(FrontierOracle):
                 return np.array([fb, dodge_lr, tn, 0, use, wpn], dtype=np.int64)
 
         # Open closed door directly in front of us
-        if can_open_front_door and not self.prev_use and self.use_cooldown == 0:
+        if press_door:
             self._pending_door = ahead_cell
             self.fwd_hist.append(False)
             return np.array([0, 0, 0, 0, 1, wpn], dtype=np.int64)
@@ -508,13 +507,9 @@ class ApexTeacher(FrontierOracle):
                     if math.hypot(dcx - px, dcy - py) < 110.0:
                         door_err = _wrap_deg(math.degrees(math.atan2(dcy - py, dcx - px)) - ang_deg)
                         tn = 1 if door_err > TURN_START_DEG else (2 if door_err < -TURN_START_DEG else 0)
-                        use = 0
-                        if abs(door_err) < 30.0 and not self.prev_use and self.use_cooldown == 0:
-                            use = 1
-                            self._pending_door = next_path_cell
-                        fb = 1 if (abs(door_err) < 30.0 and front_clear > 36.0 and use == 0) else 0
+                        fb = 1 if abs(door_err) < 30.0 and front_clear > 36.0 else 0
                         self.fwd_hist.append(fb == 1)
-                        return np.array([fb, dodge_lr, tn, 0, use, wpn], dtype=np.int64)
+                        return np.array([fb, dodge_lr, tn, 0, 0, wpn], dtype=np.int64)
 
         # Steering along path
         err = nav_err_deg if nav_err_deg is not None else 0.0
@@ -525,7 +520,6 @@ class ApexTeacher(FrontierOracle):
         tn = self.turn_dir
         fb = 1 if abs(err) < ROTATE_IN_PLACE_DEG else 0
         lr = dodge_lr
-        use = 0
 
         # Stuck recovery (pressing forward for 12 steps without moving > 20u)
         self.fwd_hist.append(fb == 1)
@@ -540,8 +534,5 @@ class ApexTeacher(FrontierOracle):
                 self.stuck_dir = 1 if (self.stuck_count % 2 == 1) else 2
                 self.stuck_timer = 7
                 lr = self.stuck_dir
-                if center_hits_door and center_door_d < 100.0 and not self.prev_use and self.use_cooldown == 0:
-                    use = 1
-                    self._pending_door = ahead_cell
 
-        return np.array([fb, lr, tn, hip_atk, use, wpn], dtype=np.int64)
+        return np.array([fb, lr, tn, hip_atk, 0, wpn], dtype=np.int64)
