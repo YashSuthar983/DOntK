@@ -49,17 +49,34 @@ def _summarize_tiers(report: dict) -> str:
     return " | ".join(parts)
 
 
+def calibration_rank(report: dict, objective: str) -> tuple:
+    if objective == "score":
+        return (report["weighted_total_score"],)
+    # Lexicographic max-min: improve the weakest map first, then the next weakest.
+    rates = tuple(sorted(level["exit_rate"] for level in report["levels"]))
+    return rates, report["exit_rate"], report["weighted_total_score"]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", default="submission/weights/aegis3d.pt")
     ap.add_argument("--suite", default="training/wads/eval_locked/eval_suite.json")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--calibrate", action="store_true", help="Sweep decode_temps and write best into weights file")
+    ap.add_argument("--objective", choices=("clear", "score"), default="clear")
+    ap.add_argument("--seeds-per-map", type=int, default=1,
+                    help="Play consecutive seeds starting at each manifest seed")
     ap.add_argument("--out-json", default="training/checkpoints/eval_report.json")
     args = ap.parse_args()
+    if args.seeds_per_map < 1:
+        ap.error("--seeds-per-map must be positive")
 
     dev = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else (args.device if args.device != "auto" else "cpu")
     suite = json.loads(Path(args.suite).read_text(encoding="utf-8"))
+    if not suite:
+        ap.error("the evaluation suite is empty")
+    suite = [{**entry, "seed": int(entry.get("seed", 0)) + offset}
+             for entry in suite for offset in range(args.seeds_per_map)]
 
     agent = DoomAgent(observation_space(), action_space(), dev)
     wpath = Path(args.weights)
@@ -74,10 +91,11 @@ def main() -> None:
         rep = evaluate_suite(agent, suite, out_json=args.out_json)
         print(f"Weighted Score: {rep['weighted_total_score']:.2f} | Exit: {rep['exit_rate']*100:.1f}% | Surv: {rep['survival_rate']*100:.1f}% | p50: {rep['mean_p50_ms']:.2f}ms")
         print(_summarize_tiers(rep))
+        print(f"Lowest per-level clear rate: {rep['min_level_exit_rate']:.1%}")
         return
 
     best_name, best_temps, best_rep = None, None, None
-    best_score = -1e9
+    best_rank = None
     for name, temps in CANDIDATE_TEMPS.items():
         agent.decode_temps = temps
         rep = evaluate_suite(agent, suite)
@@ -86,8 +104,9 @@ def main() -> None:
             f"surv={rep['survival_rate']*100:5.1f}% p50={rep['mean_p50_ms']:.2f}ms | {_summarize_tiers(rep)}",
             flush=True,
         )
-        if rep["weighted_total_score"] > best_score:
-            best_score = rep["weighted_total_score"]
+        rank = calibration_rank(rep, args.objective)
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
             best_name, best_temps, best_rep = name, temps, rep
 
     assert best_rep is not None and best_temps is not None
@@ -99,7 +118,9 @@ def main() -> None:
     tmp = wpath.with_suffix(".tmp")
     torch.save({"model": save_sd, "decode_temps": list(best_temps)}, tmp)
     tmp.replace(wpath)
-    print(f"\nSaved optimal decode_temps ({best_name}: {best_temps}) -> {wpath} | Best Weighted Score: {best_score:.2f}")
+    print(f"\nSaved {best_name} temperatures for {args.objective} -> {wpath} | "
+          f"Lowest per-level clear rate: {best_rep['min_level_exit_rate']:.1%} | "
+          f"Weighted score: {best_rep['weighted_total_score']:.2f}")
 
 
 if __name__ == "__main__":
