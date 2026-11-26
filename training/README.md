@@ -25,3 +25,24 @@ WAD's geometry. This teacher routes to a reachable exit first, then to a reachab
 key or remote switch when needed. It checks live remote-door clearance before
 routing through a sector. The default `--teacher frontier` keeps the original
 fog-of-war behavior.
+
+## Fine-tuning Aegis3D from recovery demonstrations
+
+A recovery manifest is a JSON array with `id`, `wad`, `map`, `seed`, `ticks`, `tier`,
+and `split: "training"` for each case. The demonstration directory uses `<id>.npz`
+files with `prefix` and `recovery` arrays of shape `(steps, 9)`. `prefix` contains
+the student's executed buttons before intervention. It may be empty for a
+successful demonstration from spawn.
+
+```bash
+python training/train_recovery.py --weights submission/weights/aegis3d.pt \
+    --manifest /tmp/recovery-manifest.json --demos /tmp/demos \
+    --heads 6 --output /tmp/recovery-policy.pt
+```
+
+Every replay must reach an engine-confirmed exit before the optimizer runs.
+The recorded actions update the recurrent state during replay. `--heads 3`
+fits movement only. `--heads 6` also fits attack, USE, and weapon switching.
+A separate JSON report includes hashes and the number of supervised decisions.
+Compare the new checkpoint with the submitted one on the same fresh maps and
+seeds before promoting it.
