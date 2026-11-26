@@ -93,7 +93,7 @@ def _worker_loop(conn, wad_paths: list[str], episode_ticks: int, gamma: float, s
                     inf_l.append(inf)
                     if oracles is not None:
                         oracles[i].reset()
-                        o_acts[i], _ = oracles[i].act(o, e)
+                        o_acts[i], _ = oracles[i].act(o, e, assume_executed=False)
                 conn.send(_pack(
                     obs_l, inf_l, o_acts,
                     np.zeros(len(envs), dtype=np.float32),
@@ -116,8 +116,10 @@ def _worker_loop(conn, wad_paths: list[str], episode_ticks: int, gamma: float, s
                         o, inf = e.reset()
                         if oracles is not None:
                             oracles[i].reset()
+                    elif oracles is not None:
+                        oracles[i].record_action(acts_mb[i])
                     if oracles is not None:
-                        o_acts[i], _ = oracles[i].act(o, e)
+                        o_acts[i], _ = oracles[i].act(o, e, assume_executed=False)
                     obs_l.append(o)
                     inf_l.append(inf)
                 pkt = _pack(obs_l, inf_l, o_acts, rews, dones, exits)
