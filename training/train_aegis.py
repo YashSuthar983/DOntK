@@ -136,7 +136,10 @@ def main() -> None:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"], strict=False)
         if "opt" in ckpt and ckpt.get("phase") == args.phase:
-            opt.load_state_dict(ckpt["opt"])
+            if "slot_mem.write_routing.weight" in ckpt["model"]:
+                opt.load_state_dict(ckpt["opt"])
+            else:
+                print("Starting a fresh optimizer for the new landmark write weights.", flush=True)
             global_step = int(ckpt.get("global_step", 0))
             update_idx = int(ckpt.get("update_idx", 0))
         print(f"[AEGIS-3D] Loaded weights from {args.resume} (phase={ckpt.get('phase')}, step={global_step:,})")
