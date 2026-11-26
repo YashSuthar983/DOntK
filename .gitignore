@@ -222,3 +222,7 @@ _vizdoom.ini
 
 # Local validator / scorer artifacts
 *.lmp
+
+# Generated training WAD shards & intermediate checkpoints (keep submission/weights/ in Git LFS)
+training/wads/
+training/checkpoints/
