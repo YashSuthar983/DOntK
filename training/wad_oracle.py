@@ -710,7 +710,16 @@ class FastDoomPackEnv:
         for sid, lock in field.door_sectors.items():
             if lock <= 0:
                 continue
-            has_k = (red if lock in (129, 1) else (blue if lock in (130, 2) else (yellow if lock in (131, 3) else (red or blue or yellow))))
+            if lock in (129, 1):
+                has_k = red
+            elif lock in (130, 2):
+                has_k = blue
+            elif lock in (131, 3):
+                has_k = yellow
+            elif lock in (101, 229):
+                has_k = red and blue and yellow
+            else:
+                has_k = red or blue or yellow
             if has_k:
                 continue
             if floor is not None and ceil is not None and 0 <= sid < len(floor) and (ceil[sid] - floor[sid]) >= 48.0:
