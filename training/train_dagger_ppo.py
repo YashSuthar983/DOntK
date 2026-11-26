@@ -39,6 +39,7 @@ from aegis3d import (
     BEV_SIZE,
     factored_to_multibinary,
 )
+from training.checkpoint import restore_optimizer
 from training.frontier_oracle import FrontierOracle
 from training.wad_oracle import FastDoomPackEnv
 
@@ -93,7 +94,7 @@ def _worker_loop(conn, wad_paths: list[str], episode_ticks: int, gamma: float, s
                     inf_l.append(inf)
                     if oracles is not None:
                         oracles[i].reset()
-                        o_acts[i], _ = oracles[i].act(o, e)
+                        o_acts[i], _ = oracles[i].act(o, e, assume_executed=False)
                 conn.send(_pack(
                     obs_l, inf_l, o_acts,
                     np.zeros(len(envs), dtype=np.float32),
@@ -116,8 +117,10 @@ def _worker_loop(conn, wad_paths: list[str], episode_ticks: int, gamma: float, s
                         o, inf = e.reset()
                         if oracles is not None:
                             oracles[i].reset()
+                    elif oracles is not None:
+                        oracles[i].record_action(acts_mb[i])
                     if oracles is not None:
-                        o_acts[i], _ = oracles[i].act(o, e)
+                        o_acts[i], _ = oracles[i].act(o, e, assume_executed=False)
                     obs_l.append(o)
                     inf_l.append(inf)
                 pkt = _pack(obs_l, inf_l, o_acts, rews, dones, exits)
@@ -312,7 +315,17 @@ def _grounding_loss(
 ) -> torch.Tensor:
     # 1. Balanced SE(2) Odometry SmoothL1 (equal scale for translation/16 and sharp angular heading!)
     l_odom_xy = F.smooth_l1_loss(extras["odom"][..., :2].float() / 16.0, odom_tgt[..., :2].float() / 16.0)
-    l_odom_ang = F.smooth_l1_loss(extras["odom"][..., 2:4].float(), odom_tgt[..., 2:4].float(), beta=0.1)
+    # A linear turn-button response has a short gradient path even when PPO
+    # co-trains the ray network. Give turning and stationary samples equal
+    # weight so long straight corridors cannot dominate the yaw supervisor.
+    yaw_error = F.smooth_l1_loss(
+        extras["odom"][..., 2:4].float(), odom_tgt[..., 2:4].float(), beta=0.1, reduction="none"
+    ).mean(dim=-1)
+    turning = odom_tgt[..., 2].abs() > 0.01
+    n_turn = turning.sum().clamp_min(1)
+    n_straight = (~turning).sum().clamp_min(1)
+    yaw_weights = torch.where(turning, 1.0 / n_turn, 1.0 / n_straight)
+    l_odom_ang = (yaw_error * yaw_weights).sum() / yaw_weights.sum()
     l_odom = l_odom_xy + 4.0 * l_odom_ang
 
     # 2. Observed-Only Masked 32x32 BEV BCE (zero hallucination behind walls!)
@@ -378,6 +391,7 @@ def main() -> None:
     ap.add_argument("--milestone-every", type=int, default=250000, help="Save stripped milestone copy every N steps")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+    torch.manual_seed(args.seed)
 
     device = torch.device(
         "cuda" if (args.device == "auto" and torch.cuda.is_available())
@@ -401,10 +415,7 @@ def main() -> None:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"], strict=False)
         if not args.reset_step and "opt" in ckpt and ckpt.get("mode") == args.mode:
-            if "slot_mem.write_routing.weight" in ckpt["model"]:
-                opt.load_state_dict(ckpt["opt"])
-            else:
-                print("Starting a fresh optimizer for the new landmark write weights.", flush=True)
+            restore_optimizer(opt, model, ckpt)
             global_step = int(ckpt.get("global_step", 0))
             update_idx = int(ckpt.get("update_idx", 0))
         print(f"[AEGIS-3D v2] Resumed from {args.resume} (prev_mode={ckpt.get('mode')}, reset_step={args.reset_step}, step={global_step:,})", flush=True)
