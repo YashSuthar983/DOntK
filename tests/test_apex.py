@@ -17,8 +17,9 @@ for p in (str(ROOT), str(ROOT / "env"), str(ROOT / "submission")):
 from agent import DoomAgent
 from apex_net import ApexNet, apex_factored_to_multibinary, blocked_edge_buttons
 from doom_env import action_space, make_env, observation_space
+from doom_env.sensors import RAY_DOOR
 from egomap import EgoMapBuilder, FINE_CROP, N_FIXED_CH, PREVIOUS_ACTION, VEC_DIM, WIDE_CROP
-from training.apex_teacher import ApexTeacher, dir_rel_to_bin
+from training.apex_teacher import ApexTeacher, USE_RANGE, dir_rel_to_bin
 from training.train_apex import _legal_teacher_actions, _sample_factored
 from training.wad_oracle import FastDoomPackEnv
 
@@ -171,5 +172,32 @@ def test_apex_teacher_retries_skipped_weapon_press():
         teacher.record_action(buttons)
         label, _ = teacher.act(obs, env, assume_executed=False)
         assert label[5] == 0
+    finally:
+        env.close()
+
+
+def test_apex_teacher_approaches_door_before_pressing_use():
+    env = FastDoomPackEnv(ROOT / "maps" / "two_rooms.wad", compute_spatial_targets=False)
+    teacher = ApexTeacher()
+    try:
+        obs, _ = env.reset(seed=0)
+        saw_door_outside_use_range = False
+        for _ in range(150):
+            _, action = teacher.act(obs, env)
+            hit_type = obs["rays"]["hit_type"][0]
+            distance = float(obs["rays"]["distance"][0]) * 1024
+            if hit_type == RAY_DOOR and USE_RANGE < distance < 92:
+                saw_door_outside_use_range = True
+                assert not action[7]
+                assert teacher.use_cooldown == 0
+            if action[7]:
+                assert saw_door_outside_use_range
+                assert hit_type == RAY_DOOR
+                assert distance <= USE_RANGE
+                break
+            obs, _, term, trunc, _ = env.step(action)
+            assert not (term or trunc)
+        else:
+            pytest.fail("Teacher did not approach and use the door.")
     finally:
         env.close()
