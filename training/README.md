@@ -18,6 +18,14 @@ PYTHONPATH=.:env:submission python training/eval_and_calibrate.py \
 
 The report includes individual seeds and outcomes, exits and attempts per level, and the lowest level clear rate. With `--calibrate --objective clear`, the evaluator ranks decoding settings by their weakest levels first, breaking ties with pooled clears and weighted score. Use `--objective score` for score-first calibration. Calibration writes the selected temperatures to `--weights`. Measure a chosen configuration on independent maps before reporting generalization.
 
+## Training with the objective teacher
+
+Add `--teacher objective` to a `train_dagger_ppo.py --mode dagger` run to use the training
+WAD's geometry. This teacher routes to a reachable exit first, then to a reachable
+key or remote switch when needed. It checks live remote-door clearance before
+routing through a sector. The default `--teacher frontier` keeps the original
+fog-of-war behavior.
+
 ## Fine-tuning Aegis3D from recovery demonstrations
 
 A recovery manifest is a JSON array with `id`, `wad`, `map`, `seed`, `ticks`, `tier`,
