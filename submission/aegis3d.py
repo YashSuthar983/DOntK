@@ -434,13 +434,29 @@ class NeuralBEVMapModule(nn.Module):
 class SlotLandmarkMemory(nn.Module):
     """Exact 2x2 SE(2)-rotated discrete neural landmark slots (Doors, Locks, Switches, Exits, Keys)."""
 
-    def __init__(self, scene_dim: int = 224) -> None:
+    def __init__(self, scene_dim: int = 224, *, init_missing_routing: bool = False) -> None:
         super().__init__()
+        self.init_missing_routing = init_missing_routing
         self.write_gate = nn.Sequential(nn.Linear(scene_dim, 64), nn.SiLU(inplace=True), nn.Linear(64, 3 + SLOT_DIM))
+        self.write_routing = nn.Linear(scene_dim, NUM_SLOTS, bias=False)
+        nn.init.normal_(self.write_routing.weight, std=0.01)
         self.query_proj = nn.Linear(scene_dim + 6, SLOT_DIM)
         self.key_proj = nn.Linear(SLOT_DIM + 3, SLOT_DIM)
         self.val_proj = nn.Linear(SLOT_DIM + 3, SLOT_DIM)
         self.out_proj = nn.Sequential(nn.Linear(SLOT_DIM, 80), nn.LayerNorm(80), nn.SiLU(inplace=True))
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ) -> None:
+        routing_key = prefix + "write_routing.weight"
+        if routing_key not in state_dict:
+            # Published checkpoints retain uniform routing. Fine-tuning an older
+            # checkpoint starts with distinct routing weights so the slots can learn.
+            weight = self.write_routing.weight.detach()
+            state_dict[routing_key] = weight if self.init_missing_routing else torch.zeros_like(weight)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
 
     def forward(
         self,
@@ -463,7 +479,8 @@ class SlotLandmarkMemory(nn.Module):
         cand_xy = torch.tanh(w_raw[:, 1:3]) * 256.0
         cand_feat = w_raw[:, 3:]
 
-        slot_weights = torch.softmax(-slot_conf.squeeze(-1) * 5.0, dim=-1).unsqueeze(-1) * w_prob.unsqueeze(-1)
+        write_scores = self.write_routing(scene_ctx) - 5.0 * slot_conf.squeeze(-1)
+        slot_weights = torch.softmax(write_scores, dim=-1).unsqueeze(-1) * w_prob.unsqueeze(-1)
         new_xy = (1.0 - slot_weights) * new_xy + slot_weights * cand_xy.unsqueeze(1)
         new_feat = (1.0 - slot_weights) * slot_feat + slot_weights * cand_feat.unsqueeze(1)
         new_conf = (1.0 - slot_weights) * (slot_conf * 0.999) + slot_weights * torch.ones_like(slot_conf)
@@ -515,7 +532,7 @@ class AEGIS3D(nn.Module):
 
         scene_dim = 128 + 96  # ray_global(128) + vitals_ctx(96) = 224
         self.bev_module = NeuralBEVMapModule()
-        self.slot_mem = SlotLandmarkMemory(scene_dim=scene_dim)
+        self.slot_mem = SlotLandmarkMemory(scene_dim=scene_dim, init_missing_routing=include_training_heads)
         self.e3b = E3BModule(scene_dim=scene_dim)
 
         # Fine horizon attention (queries 16 RGB-D FOV columns with combat+vitals context)
