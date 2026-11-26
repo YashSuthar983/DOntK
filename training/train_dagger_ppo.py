@@ -378,6 +378,7 @@ def main() -> None:
     ap.add_argument("--device", default="auto")
     ap.add_argument("--save", default="training/checkpoints/aegis_v2.pt")
     ap.add_argument("--resume", default=None)
+    ap.add_argument("--reset-step", action="store_true", help="Load weights only from --resume and start step/beta/LR from 0")
     ap.add_argument("--anchor-ckpt", default=None, help="Frozen DAgger anchor checkpoint for PPO KL")
     ap.add_argument("--export-submission", default="submission/weights/aegis3d.pt")
     ap.add_argument("--save-every", type=int, default=15)
@@ -405,11 +406,11 @@ def main() -> None:
     if args.resume and Path(args.resume).is_file():
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"], strict=False)
-        if "opt" in ckpt and ckpt.get("mode") == args.mode:
+        if not args.reset_step and "opt" in ckpt and ckpt.get("mode") == args.mode:
             opt.load_state_dict(ckpt["opt"])
             global_step = int(ckpt.get("global_step", 0))
             update_idx = int(ckpt.get("update_idx", 0))
-        print(f"[AEGIS-3D v2] Resumed from {args.resume} (prev_mode={ckpt.get('mode')}, step={global_step:,})", flush=True)
+        print(f"[AEGIS-3D v2] Resumed from {args.resume} (prev_mode={ckpt.get('mode')}, reset_step={args.reset_step}, step={global_step:,})", flush=True)
 
     anchor: AEGIS3D | None = None
     if args.mode == "ppo" and args.anchor_ckpt and Path(args.anchor_ckpt).is_file():

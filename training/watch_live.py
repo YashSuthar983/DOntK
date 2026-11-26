@@ -54,9 +54,60 @@ def _try_save_video(frames: list[np.ndarray], out_path: Path, fps: int = 12) -> 
     return "(video save failed)"
 
 
+_FONT_3X5: dict[str, tuple[str, ...]] = {
+    "0": ("111", "101", "101", "101", "111"), "1": ("010", "110", "010", "010", "111"),
+    "2": ("111", "001", "111", "100", "111"), "3": ("111", "001", "111", "001", "111"),
+    "4": ("101", "101", "111", "001", "001"), "5": ("111", "100", "111", "001", "111"),
+    "6": ("111", "100", "111", "101", "111"), "7": ("111", "001", "010", "010", "010"),
+    "8": ("111", "101", "111", "101", "111"), "9": ("111", "101", "111", "001", "111"),
+    "A": ("010", "101", "111", "101", "101"), "B": ("110", "101", "110", "101", "110"),
+    "C": ("111", "100", "100", "100", "111"), "D": ("110", "101", "101", "101", "110"),
+    "E": ("111", "100", "110", "100", "111"), "F": ("111", "100", "110", "100", "100"),
+    "G": ("111", "100", "101", "101", "111"), "H": ("101", "101", "111", "101", "101"),
+    "I": ("111", "010", "010", "010", "111"), "J": ("001", "001", "001", "101", "111"),
+    "K": ("101", "101", "110", "101", "101"), "L": ("100", "100", "100", "100", "111"),
+    "M": ("101", "111", "101", "101", "101"), "N": ("111", "101", "101", "101", "101"),
+    "O": ("111", "101", "101", "101", "111"), "P": ("111", "101", "111", "100", "100"),
+    "Q": ("111", "101", "101", "111", "001"), "R": ("110", "101", "110", "101", "101"),
+    "S": ("111", "100", "111", "001", "111"), "T": ("111", "010", "010", "010", "010"),
+    "U": ("101", "101", "101", "101", "111"), "V": ("101", "101", "101", "101", "010"),
+    "W": ("101", "101", "101", "111", "101"), "X": ("101", "101", "010", "101", "101"),
+    "Y": ("101", "101", "010", "010", "010"), "Z": ("111", "001", "010", "100", "111"),
+    ":": ("000", "010", "000", "010", "000"), ".": ("000", "000", "000", "000", "010"),
+    "/": ("001", "001", "010", "100", "100"), "=": ("000", "111", "000", "111", "000"),
+    "|": ("010", "010", "010", "010", "010"), "!": ("010", "010", "010", "000", "010"),
+    "[": ("110", "100", "100", "100", "110"), "]": ("011", "001", "001", "001", "011"),
+    "-": ("000", "000", "111", "000", "000"), "_": ("000", "000", "000", "000", "111"),
+    " ": ("000", "000", "000", "000", "000"),
+}
+
+
+def _draw_bitmap_text(canvas: np.ndarray, text: str, x0: int, y0: int, color=(235, 255, 235), px: int = 2) -> None:
+    h, w = canvas.shape[:2]
+    x = x0
+    for ch in text.upper():
+        glyph = _FONT_3X5.get(ch, _FONT_3X5[" "])
+        if x + 3 * px >= w:
+            break
+        for r, row in enumerate(glyph):
+            for c, bit in enumerate(row):
+                if bit == "1":
+                    y1, y2 = y0 + r * px, min(h, y0 + (r + 1) * px)
+                    x1, x2 = x + c * px, min(w, x + (c + 1) * px)
+                    canvas[y1:y2, x1:x2] = color
+        x += 4 * px
+
+
 def _annotate(rgb: np.ndarray, text_lines: list[str], scale: int = 3) -> np.ndarray:
-    """Upscale 120x160 RGB frame cleanly to 360x480."""
-    return np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
+    """Upscale 120x160 RGB frame and draw a crisp HUD status banner on top (zero-dep)."""
+    up = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
+    bar_h = 36
+    canvas = np.zeros((up.shape[0] + bar_h, up.shape[1], 3), dtype=np.uint8)
+    canvas[:bar_h] = (20, 24, 28)
+    canvas[bar_h:] = up
+    for i, line in enumerate(text_lines[:2]):
+        _draw_bitmap_text(canvas, line, 6, 5 + i * 16, color=(235, 255, 235) if i == 0 else (180, 230, 255), px=2)
+    return canvas
 
 
 def run_level(
@@ -138,7 +189,7 @@ def run_level(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--window", action="store_true", help="Open real-time ViZDoom desktop window")
-    ap.add_argument("--out-dir", default="/home/yash/Desktop/2012/live_replays")
+    ap.add_argument("--out-dir", default="live_replays", help="Directory to save MP4 replays")
     args = ap.parse_args()
 
     agent = DoomAgent(observation_space(), action_space(), "cpu")

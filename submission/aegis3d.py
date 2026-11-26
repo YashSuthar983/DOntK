@@ -653,7 +653,8 @@ class AEGIS3D(nn.Module):
 
         # 4. Factored Policy Heads + Legal Edge & Anti-Door-Bounce Masks (CONTRACT.md §3, RULES.md §1)
         logits = [head(new_h) for head in self.action_heads]
-        door_front = (ray_t[:, 0] == 2) | (ray_t[:, 0] == 3) | (ray_t[:, 1] == 2) | (ray_t[:, 63] == 2)
+        front_rt = ray_t[:, (0, 1, 63)]
+        door_front = ((front_rt == 2) | (front_rt == 3)).any(dim=-1)
         use_blocked = (state.prev_actions[:, 0, 7] > 0.5) | (door_front & (state.steps_since_use < 8))
         logits = self._apply_legal_masks(logits, use_blocked, state.wpn_cooldown > 0)
 
@@ -770,8 +771,8 @@ class AEGIS3D(nn.Module):
 
         gru_all = torch.stack(gru_h_list, dim=0)  # (L, B, GRU_DIM)
         logits = [head(gru_all) for head in self.action_heads]
-        rt_seq = obs_seq["ray_hit_type"].to(torch.int64)
-        door_front_seq = (rt_seq[..., 0] == 2) | (rt_seq[..., 0] == 3) | (rt_seq[..., 1] == 2) | (rt_seq[..., 63] == 2)
+        front_rt_seq = obs_seq["ray_hit_type"].to(torch.int64)[..., (0, 1, 63)]
+        door_front_seq = ((front_rt_seq == 2) | (front_rt_seq == 3)).any(dim=-1)
         use_blocked_seq = (prev_act_seq[:, :, 0, 7] > 0.5) | (door_front_seq & (since_use_seq < 8))
         logits = self._apply_legal_masks(logits, use_blocked_seq, wpn_cd_seq > 0)
 

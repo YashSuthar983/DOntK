@@ -108,7 +108,8 @@ def main() -> None:
     ])
 
     # Stage 1B: Pure-Student DAgger Hardening on Hard Tiers + Freedoom2 (beta 0.25 -> 0.00)
-    d2_resume = d2_ckpt if d2_ckpt.is_file() else d1_ckpt
+    d2_exists = d2_ckpt.is_file()
+    d2_resume = d2_ckpt if d2_exists else d1_ckpt
     _run([
         py, "training/train_dagger_ppo.py",
         "--mode", "dagger",
@@ -126,6 +127,7 @@ def main() -> None:
         "--total-steps", str(args.dagger2_steps),
         "--device", args.device,
         "--resume", str(d2_resume),
+        *([] if d2_exists else ["--reset-step"]),
         "--save", str(d2_ckpt),
         "--export-submission", str(export),
         "--save-every", "20",
