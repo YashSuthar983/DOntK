@@ -194,24 +194,36 @@ def evaluate_agent_on_map(
 
 def evaluate_suite(agent: Any, suite: list[dict], out_json: str | Path | None = None) -> dict:
     """Evaluate across a list of map dicts: {wad, map_name, tier, episode_ticks, seed}."""
-    results = [
-        evaluate_agent_on_map(
-            agent,
-            entry["wad"],
-            entry.get("map_name", "MAP01"),
-            tier=int(entry.get("tier", 1)),
-            episode_ticks=int(entry.get("episode_ticks", 2100)),
-            seed=int(entry.get("seed", 0)),
-        )
-        for entry in suite
+    trials = [
+        (str(Path(e["wad"]).resolve()), e.get("map_name", "MAP01").upper(),
+         int(e.get("episode_ticks", 2100)), int(e.get("tier", 1)), int(e.get("seed", 0)))
+        for e in suite
     ]
+    if len(trials) != len(set(trials)):
+        raise ValueError("Overlapping map/seed entries; supply disjoint play seeds for each level")
+    results = []
+    maps = []
+    by_level = {}
+    for wad, name, cap, tier, seed in trials:
+        result = evaluate_agent_on_map(agent, wad, name, tier=tier, episode_ticks=cap, seed=seed)
+        results.append(result)
+        maps.append({**asdict(result), "wad": wad, "map_name": name, "seed": seed})
+        by_level.setdefault((wad, name, cap, tier), {})[seed] = result.exit_reached
     weighted = sum(r.total_score * TIER_WEIGHTS.get(r.tier, 1.0) for r in results)
+
+    levels = [
+        {"wad": wad, "map_name": name, "episode_ticks": cap, "tier": tier, "seeds": list(runs),
+         "exits": sum(runs.values()), "episodes": len(runs), "exit_rate": sum(runs.values()) / len(runs)}
+        for (wad, name, cap, tier), runs in by_level.items()
+    ]
     summary = {
         "weighted_total_score": round(weighted, 2),
         "exit_rate": round(float(np.mean([r.exit_reached for r in results])), 4) if results else 0.0,
         "survival_rate": round(float(np.mean([not r.dead for r in results])), 4) if results else 0.0,
         "mean_p50_ms": round(float(np.mean([r.p50_ms for r in results])), 2) if results else 0.0,
-        "maps": [asdict(r) for r in results],
+        "maps": maps,
+        "levels": levels,
+        "min_level_exit_rate": min((level["exit_rate"] for level in levels), default=0.0),
     }
     if out_json is not None:
         Path(out_json).parent.mkdir(parents=True, exist_ok=True)

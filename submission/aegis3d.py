@@ -222,10 +222,21 @@ class CircularRayAndOdometry(nn.Module):
         nn.init.zeros_(self.odom_mlp[-1].weight)
         with torch.no_grad():
             self.odom_mlp[-1].bias.copy_(torch.tensor([0.0, 0.0, 0.0, 1.0]))
+        # Learn the yaw response to consecutive turn buttons; ray matching still
+        # supplies the residual for collisions, external movement and drift.
+        self.turn_yaw = nn.Linear(4, 2, bias=False)
+        nn.init.zeros_(self.turn_yaw.weight)
 
         angles = torch.arange(64, dtype=torch.float32) * (2.0 * math.pi / 64.0)
         self.register_buffer("cos_a", torch.cos(angles), persistent=False)
         self.register_buffer("sin_a", torch.sin(angles), persistent=False)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        # Old checkpoints predict all yaw through odom_mlp.
+        key = prefix + "turn_yaw.weight"
+        if key not in state_dict:
+            state_dict[key] = torch.zeros_like(self.turn_yaw.weight)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     def forward(
         self,
@@ -288,7 +299,8 @@ class CircularRayAndOdometry(nn.Module):
         odom_in = torch.cat([xcorr, vel_xyz.float() / 20.0, prev_actions.float().reshape(b, -1)], dim=-1)
         raw_odom = self.odom_mlp(odom_in.to(self.odom_mlp[0].weight.dtype))
         dx_dy = raw_odom[:, :2] * 32.0
-        uv = raw_odom[:, 2:4]
+        recent_turns = prev_actions[:, :2, 4:6].reshape(b, 4)
+        uv = raw_odom[:, 2:4] + self.turn_yaw(recent_turns.to(raw_odom.dtype))
         uv = uv / (uv.norm(dim=-1, keepdim=True) + 1e-6)
         odom = torch.cat([dx_dy, uv], dim=-1)
         return ray_global, bev_splat, odom

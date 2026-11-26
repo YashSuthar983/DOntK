@@ -32,6 +32,7 @@ for _p in (str(_ROOT), str(_ROOT / "submission")):
         sys.path.insert(0, _p)
 
 from aegis3d import AEGIS3D, AgentMemoryState, factored_to_multibinary
+from training.checkpoint import restore_optimizer
 from training.teacher import OmniscientTeacher
 from training.wad_oracle import FastDoomPackEnv
 
@@ -136,7 +137,7 @@ def main() -> None:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"], strict=False)
         if "opt" in ckpt and ckpt.get("phase") == args.phase:
-            opt.load_state_dict(ckpt["opt"])
+            restore_optimizer(opt, model, ckpt)
             global_step = int(ckpt.get("global_step", 0))
             update_idx = int(ckpt.get("update_idx", 0))
         print(f"[AEGIS-3D] Loaded weights from {args.resume} (phase={ckpt.get('phase')}, step={global_step:,})")
