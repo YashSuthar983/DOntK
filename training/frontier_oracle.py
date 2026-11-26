@@ -64,6 +64,8 @@ class FrontierOracle:
         self.damage_spin_timer = 0
         self.door_wait_timer = 0
         self.use_cooldown = 0
+        self._pending_door: tuple[int, int] | None = None
+        self._pending_switch: tuple[tuple[int, int], int | None] | None = None
         self.wpn_cooldown = 0
         self.strafe_dir = 1  # 1=left, 2=right
         self.strafe_timer = 0
@@ -247,7 +249,37 @@ class FrontierOracle:
                 return _ret(("remote_switch", (sx, sy), (scx, scy)))
         return _ret(("none", None, None))
 
-    def act(self, obs: dict, env: FastDoomPackEnv) -> tuple[np.ndarray, np.ndarray]:
+    def record_action(self, action: np.ndarray) -> None:
+        """Update USE state from the buttons sent to ViZDoom."""
+        use_pressed = bool(action[7])
+        if use_pressed and not self.prev_use:
+            if self._pending_door is not None:
+                self.door_wait_timer = 10
+                self.use_cooldown = 10
+                self.last_door_cell_used = self._pending_door
+            elif self._pending_switch is not None:
+                target_cell, sweep_length = self._pending_switch
+                self.use_cooldown = 3
+                self.switch_sweep_idx += 1
+                if sweep_length is not None and self.switch_sweep_idx >= sweep_length:
+                    self.triggered_switches.add(target_cell)
+                    self.remote_blocked_cells.clear()
+                    self.switch_sweep_idx = 0
+        self.prev_use = use_pressed
+        self._pending_door = None
+        self._pending_switch = None
+
+    def act(
+        self, obs: dict, env: FastDoomPackEnv, *, assume_executed: bool = True
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return an expert label. Mixed rollouts pass the final action to record_action."""
+        factored_action = self._propose_action(obs, env)
+        action = factored_np_to_multibinary(factored_action)
+        if assume_executed:
+            self.record_action(action)
+        return factored_action, action
+
+    def _propose_action(self, obs: dict, env: FastDoomPackEnv) -> np.ndarray:
         self.step_count += 1
         priv = env.env.privileged_state()
         field = env._fields[env.current_map]
@@ -385,14 +417,10 @@ class FrontierOracle:
                     tn = 2
                 if abs(pang) < 0.75:
                     fb = 1
-                f_act = np.array([fb, lr, tn, 0, 0, wpn], dtype=np.int64)
-                self.prev_use = False
-                return f_act, factored_np_to_multibinary(f_act)
+                return np.array([fb, lr, tn, 0, 0, wpn], dtype=np.int64)
             elif self.spawn_scan_steps < 16:
                 self.spawn_scan_steps += 1
-                f_act = np.array([0, 0, 1, 0, 0, wpn], dtype=np.int64)
-                self.prev_use = False
-                return f_act, factored_np_to_multibinary(f_act)
+                return np.array([0, 0, 1, 0, 0, wpn], dtype=np.int64)
 
         # Damage-turn reflex if shot from behind / flank with no enemy in front!
         if took_damage and not enemies:
@@ -405,9 +433,7 @@ class FrontierOracle:
             else:
                 tn = 1
             lr = 1 if left_clear >= right_clear else 2
-            f_act = np.array([0, lr, tn, 0, 0, wpn], dtype=np.int64)
-            self.prev_use = False
-            return f_act, factored_np_to_multibinary(f_act)
+            return np.array([0, lr, tn, 0, 0, wpn], dtype=np.int64)
 
         # ------------------------------------------------------------------
         # 2. Pro DOOM Speed-Tactical Combat:
@@ -471,9 +497,7 @@ class FrontierOracle:
             if edist < 140.0 and back_clear > 36.0:
                 fb = 2
 
-            f_act = np.array([fb, lr, tn, atk, use, wpn], dtype=np.int64)
-            self.prev_use = bool(use)
-            return f_act, factored_np_to_multibinary(f_act)
+            return np.array([fb, lr, tn, atk, use, wpn], dtype=np.int64)
 
         # Opportunistic hip-fire while navigating if an enemy is right in front of our crosshair!
         if has_loaded_gun and enemies:
@@ -494,9 +518,7 @@ class FrontierOracle:
                     tn = 2
                 if abs(pang) < 0.70:
                     fb = 1
-                f_act = np.array([fb, lr, tn, atk, use, wpn], dtype=np.int64)
-                self.prev_use = bool(use)
-                return f_act, factored_np_to_multibinary(f_act)
+                return np.array([fb, lr, tn, atk, use, wpn], dtype=np.int64)
 
         # ------------------------------------------------------------------
         # 4. Fog-of-War Navigation (Key -> Remote Switch -> Exit -> Frontier)
@@ -542,9 +564,7 @@ class FrontierOracle:
                         self.remote_blocked_cells.add(self.last_door_cell_used)
                         # Remote door may have closed again after 150 tics -> allow re-triggering remote switches!
                         self.triggered_switches.clear()
-                f_act = np.array([0, 0, 0, 0, 0, wpn], dtype=np.int64)
-                self.prev_use = False
-                return f_act, factored_np_to_multibinary(f_act)
+                return np.array([0, 0, 0, 0, 0, wpn], dtype=np.int64)
             else:
                 self.door_wait_timer = 0
                 self.use_cooldown = min(self.use_cooldown, 2)
@@ -580,15 +600,9 @@ class FrontierOracle:
                         fb = 1
                     if not self.prev_use and self.use_cooldown == 0:
                         use = 1
-                        self.use_cooldown = 3
-                        self.switch_sweep_idx += 1
-                        if nav_kind == "remote_switch" and self.switch_sweep_idx >= len(wall_angles):
-                            self.triggered_switches.add(target_cell)
-                            self.remote_blocked_cells.clear()
-                            self.switch_sweep_idx = 0
-                f_act = np.array([fb, lr, tn, 0, use, wpn], dtype=np.int64)
-                self.prev_use = bool(use)
-                return f_act, factored_np_to_multibinary(f_act)
+                        sweep_length = len(wall_angles) if nav_kind == "remote_switch" else None
+                        self._pending_switch = (target_cell, sweep_length)
+                return np.array([fb, lr, tn, 0, use, wpn], dtype=np.int64)
 
         if target_xy is not None:
             d_geo, sin_g, cos_g = field.geodesic_query(px, py, heading, target_xy, blocked_grid=blocked)
@@ -604,34 +618,22 @@ class FrontierOracle:
             and not ahead_is_opening
         )
         if can_open_front_door and not self.prev_use and self.use_cooldown == 0:
-            use = 1
-            self.door_wait_timer = 10
-            self.use_cooldown = 10
-            self.last_door_cell_used = ahead_cell
-            f_act = np.array([0, 0, 0, 0, use, wpn], dtype=np.int64)
-            self.prev_use = True
-            return f_act, factored_np_to_multibinary(f_act)
+            self._pending_door = ahead_cell
+            return np.array([0, 0, 0, 0, 1, wpn], dtype=np.int64)
 
         if self.stuck_timer > 0:
             self.stuck_timer -= 1
             fb = 2 if self.stuck_timer > 2 else 1
             lr = self.stuck_dir
             tn = self.stuck_dir
-            f_act = np.array([fb, lr, tn, 0, 0, wpn], dtype=np.int64)
-            self.prev_use = False
-            return f_act, factored_np_to_multibinary(f_act)
+            return np.array([fb, lr, tn, 0, 0, wpn], dtype=np.int64)
 
         if len(self.pos_hist) == 8 and not can_open_front_door:
             moved = math.hypot(px - self.pos_hist[0][0], py - self.pos_hist[0][1])
             if moved < 10.0:
                 if center_hits_door and min_door_d < 84.0 and not self.prev_use and self.use_cooldown == 0:
-                    use = 1
-                    self.door_wait_timer = 10
-                    self.use_cooldown = 10
-                    self.last_door_cell_used = ahead_cell
-                    f_act = np.array([0, 0, 0, 0, use, wpn], dtype=np.int64)
-                    self.prev_use = True
-                    return f_act, factored_np_to_multibinary(f_act)
+                    self._pending_door = ahead_cell
+                    return np.array([0, 0, 0, 0, 1, wpn], dtype=np.int64)
                 self.stuck_count += 1
                 self.stuck_timer = 6
                 self.stuck_dir = 1 if (self.stuck_count % 2 == 1) else 2
@@ -662,6 +664,4 @@ class FrontierOracle:
             _, lat_left, _ = projectiles[0]
             lr = 2 if lat_left >= 0.0 else 1
 
-        f_act = np.array([fb, lr, tn, atk, use, wpn], dtype=np.int64)
-        self.prev_use = bool(use)
-        return f_act, factored_np_to_multibinary(f_act)
+        return np.array([fb, lr, tn, atk, use, wpn], dtype=np.int64)
