@@ -15,10 +15,11 @@ for p in (str(ROOT), str(ROOT / "env"), str(ROOT / "submission")):
         sys.path.insert(0, p)
 
 from agent import DoomAgent
-from apex_net import ApexNet, apex_factored_to_multibinary
+from apex_net import ApexNet, apex_factored_to_multibinary, blocked_edge_buttons
 from doom_env import action_space, make_env, observation_space
-from egomap import EgoMapBuilder, FINE_CROP, N_FIXED_CH, VEC_DIM, WIDE_CROP
+from egomap import EgoMapBuilder, FINE_CROP, N_FIXED_CH, PREVIOUS_ACTION, VEC_DIM, WIDE_CROP
 from training.apex_teacher import ApexTeacher, dir_rel_to_bin
+from training.train_apex import _legal_teacher_actions, _sample_factored
 from training.wad_oracle import FastDoomPackEnv
 
 
@@ -72,13 +73,20 @@ def test_apex_net_forward_backward_and_export(tmp_path):
         "pos_idx": torch.tensor([100, 100], dtype=torch.long),
         "wmask": torch.tensor([0.0, 1.0]),
     }
+    obs["vec"][:, PREVIOUS_ACTION] = 0
+    obs["vec"][0, PREVIOUS_ACTION.start + 7] = 1
     priv = torch.randn(2, 24)
-    logits1, state1, _ = model.forward_step(obs, state, priv_vec=priv)
+    _, state1, _ = model.forward_step(obs, state, priv_vec=priv)
     logits, next_state, extras = model.forward_step(obs, state1, priv_vec=priv)
     assert len(logits) == 6
     # Loaded weapon (batch 0, wmask=0) must suppress NextWeapon=1
     assert float(logits[5][0, 1].detach()) < -1e3
     assert float(logits[5][1, 1].detach()) > -1e2
+    assert float(logits[4][0, 1].detach()) == -1e4
+    assert float(logits[4][1, 1].detach()) > -1e2
+    action, logp, _ = _sample_factored(logits)
+    assert action[0, 4:].tolist() == [0, 0]
+    assert torch.isfinite(logp).all()
     # Gradients flow through policy, VIN, 2-step Neural Map write->read, and critic
     loss = sum(lg.square().mean() for lg in logits) + extras["value"].square().mean() + extras["dir_logits"].square().mean()
     loss.backward()
@@ -97,7 +105,9 @@ def test_apex_net_forward_backward_and_export(tmp_path):
         agent.reset()
         t0 = time.perf_counter()
         for _ in range(10):
+            previous = agent._prev_action.copy()
             a = agent.act(o)
+            assert not (a[7] and previous[7])
             assert a.shape == (9,) and a.dtype == np.int8
             assert a[8] == 0  # weapon mask active while pistol has ammo
             o, _, term, trunc, _ = env.step(a)
@@ -129,5 +139,37 @@ def test_apex_teacher_clears_two_rooms_and_provides_aux_labels():
                 break
         assert exited, "ApexTeacher should clear two_rooms.wad"
         assert saw_valid_dir
+    finally:
+        env.close()
+
+
+def test_apex_teacher_actions_follow_executed_button_availability():
+    vec = torch.zeros(4, VEC_DIM)
+    vec[:, PREVIOUS_ACTION.start + 7:PREVIOUS_ACTION.stop] = torch.tensor([[0, 0], [1, 0], [0, 1], [0, 0]])
+    obs = {"vec": vec, "wmask": torch.tensor([1.0, 1.0, 1.0, 0.0])}
+    teacher = torch.tensor([[1, 2, 0, 1, 1, 1]]).repeat(4, 1)
+    expected = [[1, 1], [0, 1], [1, 0], [1, 0]]
+    assert (~blocked_edge_buttons(obs)).int().tolist() == expected
+    legal = _legal_teacher_actions(teacher, obs)
+    assert legal[:, 4:6].tolist() == expected
+    torch.testing.assert_close(legal[:, :4], teacher[:, :4])
+    assert teacher[:, 4:].eq(1).all()
+
+
+def test_apex_teacher_retries_skipped_weapon_press():
+    env = FastDoomPackEnv(ROOT / "maps" / "two_rooms.wad", compute_spatial_targets=False)
+    teacher = ApexTeacher()
+    try:
+        obs, _ = env.reset(seed=0)
+        obs["vitals"][3] = 0
+        # The student skipped the teacher's first switch. The next label can still switch.
+        label, _ = teacher.act(obs, env, assume_executed=False)
+        assert label[5] == 1
+        teacher.record_action(np.zeros(9, dtype=np.int8))
+        label, buttons = teacher.act(obs, env, assume_executed=False)
+        assert label[5] == 1
+        teacher.record_action(buttons)
+        label, _ = teacher.act(obs, env, assume_executed=False)
+        assert label[5] == 0
     finally:
         env.close()

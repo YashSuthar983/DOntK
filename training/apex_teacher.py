@@ -86,7 +86,10 @@ class ApexTeacher(FrontierOracle):
                     self.remote_blocked_cells.clear()
                     self.switch_sweep_idx = 0
         self.prev_use = use_pressed
-        self.prev_wpn_press = bool(action[8])
+        weapon_pressed = bool(action[8])
+        if weapon_pressed and not self.prev_wpn_press:
+            self.wpn_cooldown = 4
+        self.prev_wpn_press = weapon_pressed
         self._pending_door = None
         self._pending_switch = None
 
@@ -303,7 +306,6 @@ class ApexTeacher(FrontierOracle):
         wpn = 0
         if cur_ammo <= 0.0 and other_ammo > 0.0 and not self.prev_wpn_press and self.wpn_cooldown == 0:
             wpn = 1
-            self.wpn_cooldown = 4
 
         # Plan navigation target first so we know distance to exit (for near-exit rush & aux labels)
         blocked = self._build_blocked_grid(env, priv)

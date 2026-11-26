@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from egomap import FINE_CROP, GRID_SIZE, N_FIXED_CH, VEC_DIM
+from egomap import FINE_CROP, GRID_SIZE, N_FIXED_CH, PREVIOUS_ACTION, VEC_DIM
 
 torch.backends.mha.set_fastpath_enabled(False)
 
@@ -25,6 +25,15 @@ N_DIR_BINS = 17             # 16 ego-centric 22.5-deg bins + 'none'
 N_GOAL_KINDS = 5            # none, exit, key, remote_switch, frontier
 PRIV_DIM = 24               # matches FastDoomPackEnv priv_vec
 MAP_CELLS = GRID_SIZE * GRID_SIZE + 1
+
+
+def blocked_edge_buttons(obs: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Return whether USE and NEXT_WEAPON must be released for each observation."""
+    previous_action = obs["vec"][..., PREVIOUS_ACTION]
+    blocked = previous_action[..., 7:9] > 0.5
+    if "wmask" in obs:
+        blocked = torch.stack((blocked[..., 0], blocked[..., 1] | (obs["wmask"] <= 0.5)), dim=-1)
+    return blocked
 
 
 def apex_factored_to_multibinary(factored: torch.Tensor) -> torch.Tensor:
@@ -211,12 +220,12 @@ class ApexNet(nn.Module):
         pi_in = torch.cat([feat, z_plan, torch.softmax(dir_logits, dim=-1).detach()], dim=-1)
         raw_logits = self.pi_head(pi_in)
 
-        # Legal weapon-switch mask: suppress NextWeapon=1 when current weapon has ammo
-        if "wmask" in obs:
-            pen = (1.0 - obs["wmask"].float().view(B, 1)) * 1e4
-            raw_logits = torch.cat([raw_logits[:, :-1], raw_logits[:, -1:] - pen], dim=1)
-
+        # Both edge-triggered buttons must be released before they can fire again.
         logits = list(torch.split(raw_logits, HEADS, dim=-1))
+        blocked = blocked_edge_buttons(obs)
+        for head, is_blocked in zip((4, 5), blocked.unbind(dim=-1)):
+            release, press = logits[head].unbind(dim=-1)
+            logits[head] = torch.stack((release, press.masked_fill(is_blocked, -1e4)), dim=-1)
         extras: dict[str, torch.Tensor] = {"dir_logits": dir_logits}
 
         if self.include_training_heads:
