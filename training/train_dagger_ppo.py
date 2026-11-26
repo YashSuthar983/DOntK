@@ -378,6 +378,7 @@ def main() -> None:
     ap.add_argument("--milestone-every", type=int, default=250000, help="Save stripped milestone copy every N steps")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+    torch.manual_seed(args.seed)
 
     device = torch.device(
         "cuda" if (args.device == "auto" and torch.cuda.is_available())
