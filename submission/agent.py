@@ -42,8 +42,6 @@ class DoomAgent:
             self.model = ApexNet(include_training_heads=False).to(self.device)
             self.decode_temps = APEX_DEFAULT_TEMPS
             self._prev_action = np.zeros(9, dtype=np.int8)
-            self._prev_use = False
-            self._prev_wpn = False
         else:
             self.egomap = None
             self.model = AEGIS3D(include_training_heads=False).to(self.device)
@@ -87,8 +85,6 @@ class DoomAgent:
         if self.egomap is not None:
             self.egomap.reset()
             self._prev_action = np.zeros(9, dtype=np.int8)
-            self._prev_use = False
-            self._prev_wpn = False
         self._rng.manual_seed(2026)
 
     def _sample_heads(self, logits: list[torch.Tensor]) -> torch.Tensor:
@@ -113,19 +109,10 @@ class DoomAgent:
                 for k, v in feats.items()
             }
             logits, next_state, _ = self.model.forward_step(obs_t, self.state)
-            # Suppress consecutive edge-triggered USE / NEXT_WEAPON presses
-            if self._prev_use:
-                logits[4] = logits[4].clone()
-                logits[4][:, 1] = -1e4
-            if self._prev_wpn:
-                logits[5] = logits[5].clone()
-                logits[5][:, 1] = -1e4
             factored = self._sample_heads(logits)
             action_mb = apex_factored_to_multibinary(factored)[0].cpu().numpy()
             self.state = next_state
             self._prev_action = action_mb
-            self._prev_use = bool(action_mb[7])
-            self._prev_wpn = bool(action_mb[8])
             return action_mb
 
         obs_t = {

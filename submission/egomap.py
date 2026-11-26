@@ -49,6 +49,7 @@ VITALS_SCALE = np.array(
     [100.0, 100.0, 7.0, 50.0, 200.0, 50.0, 50.0, 300.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 10.0, 10.0, 10.0],
     dtype=np.float32,
 )
+PREVIOUS_ACTION = slice(len(VITALS_SCALE), len(VITALS_SCALE) + 9)
 VEC_DIM = 17 + 9 + 40 + 2  # vitals(17) + prev_action(9) + depth_profile(40) + [has_key, keys_frac]
 
 _RAY_ANG = np.arange(NUM_RAYS, dtype=np.float64) * (2.0 * math.pi / NUM_RAYS)

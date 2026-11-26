@@ -29,10 +29,9 @@ for p in (str(ROOT), str(ROOT / "env"), str(ROOT / "submission")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from apex_net import ApexNet, HEADS, apex_factored_to_multibinary
+from apex_net import ApexNet, HEADS, apex_factored_to_multibinary, blocked_edge_buttons
 from egomap import EgoMapBuilder, FINE_CROP, N_FIXED_CH, VEC_DIM, WIDE_CROP
 from training.apex_teacher import ApexTeacher, GOAL_KIND_TO_ID, dir_rel_to_bin
-from training.frontier_oracle import factored_np_to_multibinary
 from training.wad_oracle import FastDoomPackEnv
 
 
@@ -238,6 +237,12 @@ def _eval_factored(logits: list[torch.Tensor], acts: torch.Tensor) -> tuple[torc
     return sum(logps), sum(ents)
 
 
+def _legal_teacher_actions(actions: torch.Tensor, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Use the same availability for imitation targets and the executed beta mixture."""
+    edges = actions[..., 4:6].masked_fill(blocked_edge_buttons(obs), 0)
+    return torch.cat((actions[..., :4], edges), dim=-1)
+
+
 def _teacher_ce(logits: list[torch.Tensor], targets: torch.Tensor) -> torch.Tensor:
     weights = (1.0, 0.85, 1.15, 1.30, 1.75, 0.45)
     return sum(w * F.cross_entropy(lg.float(), targets[..., i]) for i, (w, lg) in enumerate(zip(weights, logits)))
@@ -298,7 +303,9 @@ def main() -> None:
             update_idx = int(ckpt.get("update_idx", 0))
         print(f"[Apex] Resumed {args.resume} (mode={args.mode}, step={global_step:,})", flush=True)
 
-    use_teacher = args.mode in ("dagger", "kickstart") or args.teacher_coef_end > 0.0
+    use_teacher = (
+        args.mode in ("dagger", "kickstart") or max(args.teacher_coef_start, args.teacher_coef_end) > 0.0
+    )
     vec = SubprocApexVecEnv(
         wad_paths=args.wad,
         num_envs=args.num_envs,
@@ -399,16 +406,17 @@ def main() -> None:
                     buf_act[t] = act_f
                     buf_logp[t] = logp
                     buf_val[t] = extras["value"].float()
-                    buf_orc[t] = torch.from_numpy(pkt["oracle_act"]).to(device, non_blocking=True)
+                    oracle_action = _legal_teacher_actions(torch.from_numpy(pkt["oracle_act"]).to(device), obs_t)
+                    buf_orc[t] = oracle_action
                     buf_dir[t] = torch.from_numpy(pkt["dir_bin"]).to(device, non_blocking=True)
                     buf_goal[t] = torch.from_numpy(pkt["goal_id"]).to(device, non_blocking=True)
                     buf_dist[t] = torch.from_numpy(pkt["goal_dist"]).to(device, non_blocking=True)
 
-                    exec_mb = apex_factored_to_multibinary(act_f).cpu().numpy()
+                    exec_action = act_f
                     if beta > 0.0:
-                        use_orc = rng.random(N) < beta
-                        for i in np.flatnonzero(use_orc):
-                            exec_mb[i] = factored_np_to_multibinary(pkt["oracle_act"][i])
+                        use_oracle = torch.from_numpy(rng.random(N) < beta).to(device).unsqueeze(-1)
+                        exec_action = torch.where(use_oracle, oracle_action, act_f)
+                    exec_mb = apex_factored_to_multibinary(exec_action).cpu().numpy()
 
                     pkt = vec.step(exec_mb)
                     rew_np, done_np, exit_np = pkt["reward"], pkt["done"], pkt["exit"]
@@ -480,25 +488,27 @@ def main() -> None:
                             for k, lg in enumerate(lgs):
                                 logits_seq[k].append(lg)
                             val_seq.append(ex["value"])
-                            dir_seq.append(ex["dir_logits"])
-                            goal_seq.append(ex["goal_logits"])
-                            dist_seq.append(ex["dist_pred"])
+                            if use_teacher:
+                                dir_seq.append(ex["dir_logits"])
+                                goal_seq.append(ex["goal_logits"])
+                                dist_seq.append(ex["dist_pred"])
                             keep = 1.0 - done_c[s, idx]
                             hc = hc * keep.unsqueeze(-1)
                             Lc = Lc * keep.view(-1, 1, 1)
 
                         s_logits = [torch.stack(ls, dim=0) for ls in logits_seq]
                         s_val = torch.stack(val_seq, dim=0)
-                        s_dir = torch.stack(dir_seq, dim=0)
-                        s_goal = torch.stack(goal_seq, dim=0)
-                        s_dist = torch.stack(dist_seq, dim=0)
-
                         l_val = F.smooth_l1_loss(s_val.float(), ret_c[:, idx].float(), beta=2.0)
-                        l_aux = (
-                            F.cross_entropy(s_dir.float().reshape(-1, s_dir.shape[-1]), dir_c[:, idx].reshape(-1))
-                            + 0.5 * F.cross_entropy(s_goal.float().reshape(-1, s_goal.shape[-1]), goal_c[:, idx].reshape(-1))
-                            + 0.25 * F.smooth_l1_loss(s_dist.float(), dist_c[:, idx].float())
-                        )
+                        l_aux = s_val.new_zeros(())
+                        if use_teacher:
+                            s_dir = torch.stack(dir_seq, dim=0)
+                            s_goal = torch.stack(goal_seq, dim=0)
+                            s_dist = torch.stack(dist_seq, dim=0)
+                            l_aux = (
+                                F.cross_entropy(s_dir.float().flatten(0, 1), dir_c[:, idx].reshape(-1))
+                                + 0.5 * F.cross_entropy(s_goal.float().flatten(0, 1), goal_c[:, idx].reshape(-1))
+                                + 0.25 * F.smooth_l1_loss(s_dist.float(), dist_c[:, idx].float())
+                            )
 
                         if args.mode == "dagger":
                             l_ce = _teacher_ce([lg.reshape(-1, lg.shape[-1]) for lg in s_logits], orc_c[:, idx].reshape(-1, 6))
