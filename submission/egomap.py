@@ -232,11 +232,8 @@ class EgoMapBuilder:
         wide_crop[7] = np.log1p(wide_crop[7]) / 3.0
 
         # 6. Compact 1D observation vectors
-        depth = np.asarray(obs["depth"], dtype=np.float32)
-        if depth.shape == (120, 160):
-            depth_prof = depth[30:90].min(axis=0).reshape(40, 4).min(axis=1) / 255.0
-        else:
-            depth_prof = np.ones(40, dtype=np.float32)
+        # Keep depth_prof constant so render_buffers=False training matches evaluation bit-for-bit
+        depth_prof = np.ones(40, dtype=np.float32)
 
         key_summary = np.array([float(kh > 0), kh / 6.0], dtype=np.float32)
         vec = np.concatenate([np.clip(vit / VITALS_SCALE, -5.0, 5.0), self.prev_action, depth_prof, key_summary]).astype(np.float32)

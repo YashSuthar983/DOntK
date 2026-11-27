@@ -21,7 +21,8 @@ WEIGHTS_PATH = SUBMISSION_DIR / "weights" / "aegis3d.pt"
 # Default calibrated per-head sampling temperatures:
 # [MoveFB, StrafeLR, TurnLR, Attack, Use, NextWeapon]
 DEFAULT_DECODE_TEMPS = (0.20, 0.30, 0.20, 0.15, 0.55, 0.15)
-APEX_DEFAULT_TEMPS = (0.50, 0.50, 0.50, 0.35, 0.50, 0.25)
+APEX_DEFAULT_TEMPS = (1.0, 1.0, 1.0, 0.70, 0.80, 0.50)
+DOOR_USE_COOLDOWN = 12  # ~1.4s at 8.75 Hz: prevents reversing a rising Doom door
 
 
 class DoomAgent:
@@ -42,6 +43,7 @@ class DoomAgent:
             self.model = ApexNet(include_training_heads=False).to(self.device)
             self.decode_temps = APEX_DEFAULT_TEMPS
             self._prev_action = np.zeros(9, dtype=np.int8)
+            self._door_use_cd = 0
         else:
             self.egomap = None
             self.model = AEGIS3D(include_training_heads=False).to(self.device)
@@ -85,6 +87,7 @@ class DoomAgent:
         if self.egomap is not None:
             self.egomap.reset()
             self._prev_action = np.zeros(9, dtype=np.int8)
+            self._door_use_cd = 0
         self._rng.manual_seed(2026)
 
     def _sample_heads(self, logits: list[torch.Tensor]) -> torch.Tensor:
@@ -109,8 +112,16 @@ class DoomAgent:
                 for k, v in feats.items()
             }
             logits, next_state, _ = self.model.forward_step(obs_t, self.state)
+            if self._door_use_cd > 0:
+                self._door_use_cd -= 1
+                logits[4] = logits[4].clone()
+                logits[4][:, 1] = -1e4
             factored = self._sample_heads(logits)
             action_mb = apex_factored_to_multibinary(factored)[0].cpu().numpy()
+            rt0 = int(observation["rays"]["hit_type"][0])
+            rd0 = float(observation["rays"]["distance"][0]) * 1024.0
+            if action_mb[7] and rt0 in (2, 3) and rd0 < 80.0:
+                self._door_use_cd = DOOR_USE_COOLDOWN
             self.state = next_state
             self._prev_action = action_mb
             return action_mb
